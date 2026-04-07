@@ -16,6 +16,7 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+          - windows-latest
         raku-version:
           - 'latest'
     runs-on: ${{ matrix.os }}
@@ -24,6 +25,9 @@ jobs:
       - uses: Raku/setup-raku@v1
         with:
           raku-version: ${{ matrix.raku-version }}
+      - name: Setup VS Dev Environment
+        if: runner.os == 'Windows'
+        uses: compnerd/gha-setup-vsdevenv@v6
       - name: Install Dependencies
         run: zef install --/test --test-depends --deps-only .
       - name: Install App::Prove6
