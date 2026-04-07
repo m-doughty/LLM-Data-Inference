@@ -1,0 +1,118 @@
+use Test;
+use lib 'lib', '../LLM_Chat/lib', '../CRoaring/lib', '../Roaring-Tags/lib';
+use LLM::Data::Inference::Router;
+use LLM::Chat::Backend;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Conversation::Message;
+use Roaring::Tags;
+use CRoaring;
+use UUID::V4;
+
+# --- Identifiable MockBackend ---
+
+class MockBackend is LLM::Chat::Backend {
+	has Str:D $.name is required;
+
+	method chat-completion(@messages, --> LLM::Chat::Backend::Response) {
+		my LLM::Chat::Backend::Response $r .= new(:id(uuid-v4()));
+		start { $r.emit('ok'); $r.done; }
+		$r;
+	}
+	method chat-completion-stream(@messages, --> LLM::Chat::Backend::Response) { self.chat-completion(@messages) }
+	method text-completion(@messages, Bool $c = False, --> LLM::Chat::Backend::Response) { self.chat-completion(@messages) }
+	method text-completion-stream(@messages, Bool $c = False, --> LLM::Chat::Backend::Response) { self.chat-completion(@messages) }
+	method cancel(LLM::Chat::Backend::Response $r) { $r.cancel }
+}
+
+sub make-backend(Str:D $name --> MockBackend:D) {
+	MockBackend.new(:$name, :settings(LLM::Chat::Backend::Settings.new));
+}
+
+plan 6;
+
+subtest 'No routes match — default backend' => {
+	plan 1;
+	my MockBackend $default = make-backend('default');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('safe', 1);
+
+	is $r.select-backend($tags, 1).name, 'default', 'Falls back to default';
+};
+
+subtest 'Single tag route matches' => {
+	plan 1;
+	my MockBackend $default = make-backend('default');
+	my MockBackend $nsfw-model = make-backend('nsfw-model');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+	$r.add-route('nsfw', $nsfw-model);
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('nsfw', 1);
+	$tags.tag('safe', 2);
+
+	is $r.select-backend($tags, 1).name, 'nsfw-model', 'NSFW doc routed correctly';
+};
+
+subtest 'Multi-tag AND route matches' => {
+	plan 2;
+	my MockBackend $default = make-backend('default');
+	my MockBackend $special = make-backend('special');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+	$r.add-route('nsfw, violent', $special);
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('nsfw', 1);
+	$tags.tag('violent', 1);
+	$tags.tag('nsfw', 2);  # nsfw only, not violent
+
+	is $r.select-backend($tags, 1).name, 'special', 'AND route matches doc with both tags';
+	is $r.select-backend($tags, 2).name, 'default', 'AND route does not match doc with only one tag';
+};
+
+subtest 'First matching route wins' => {
+	plan 1;
+	my MockBackend $default = make-backend('default');
+	my MockBackend $first = make-backend('first');
+	my MockBackend $second = make-backend('second');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+	$r.add-route('nsfw', $first);
+	$r.add-route('nsfw', $second);
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('nsfw', 1);
+
+	is $r.select-backend($tags, 1).name, 'first', 'First route takes priority';
+};
+
+subtest 'Non-matching route skipped, later route matches' => {
+	plan 1;
+	my MockBackend $default = make-backend('default');
+	my MockBackend $gore-model = make-backend('gore-model');
+	my MockBackend $nsfw-model = make-backend('nsfw-model');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+	$r.add-route('gore', $gore-model);
+	$r.add-route('nsfw', $nsfw-model);
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('nsfw', 1);  # no gore tag
+
+	is $r.select-backend($tags, 1).name, 'nsfw-model', 'Skipped gore, matched nsfw';
+};
+
+subtest 'Complex query route' => {
+	plan 2;
+	my MockBackend $default = make-backend('default');
+	my MockBackend $restricted = make-backend('restricted');
+	my LLM::Data::Inference::Router $r .= new(:default-backend($default));
+	$r.add-route('nsfw OR violent OR gore', $restricted);
+
+	my Roaring::Tags $tags .= new;
+	$tags.tag('violent', 1);
+	$tags.tag('safe', 2);
+
+	is $r.select-backend($tags, 1).name, 'restricted', 'OR route matches violent';
+	is $r.select-backend($tags, 2).name, 'default', 'Safe doc not matched by OR route';
+};

@@ -1,0 +1,37 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "LLM::Chat",
+    "Roaring::Tags",
+    "CRoaring",
+    "JSON::Fast"
+  ],
+  "description": "Structured LLM task layer with retry, JSON parsing, and query-based routing",
+  "license": "Artistic-2.0",
+  "name": "LLM::Data::Inference",
+  "perl": "6.d",
+  "provides": {
+    "LLM::Data::Inference": "lib/LLM/Data/Inference.rakumod",
+    "LLM::Data::Inference::JSONTask": "lib/LLM/Data/Inference/JSONTask.rakumod",
+    "LLM::Data::Inference::PromptBuilder": "lib/LLM/Data/Inference/PromptBuilder.rakumod",
+    "LLM::Data::Inference::Router": "lib/LLM/Data/Inference/Router.rakumod",
+    "LLM::Data::Inference::Task": "lib/LLM/Data/Inference/Task.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/LLM-Data-Inference.git",
+  "tags": [
+    "llm",
+    "pipeline",
+    "json",
+    "routing"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

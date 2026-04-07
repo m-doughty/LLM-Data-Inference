@@ -1,0 +1,30 @@
+use Test;
+use lib 'lib', '../LLM_Chat/lib', '../CRoaring/lib', '../Roaring-Tags/lib';
+use LLM::Data::Inference;
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Router;
+use LLM::Data::Inference::PromptBuilder;
+
+plan 4;
+
+subtest 'Task accessible' => {
+	plan 1;
+	ok LLM::Data::Inference::Task ~~ LLM::Data::Inference::Task, 'Task type available';
+};
+
+subtest 'JSONTask accessible' => {
+	plan 1;
+	ok LLM::Data::Inference::JSONTask ~~ LLM::Data::Inference::JSONTask, 'JSONTask type available';
+};
+
+subtest 'Router accessible' => {
+	plan 1;
+	ok LLM::Data::Inference::Router ~~ LLM::Data::Inference::Router, 'Router type available';
+};
+
+subtest 'PromptBuilder accessible' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template('test'));
+	ok $pb ~~ LLM::Data::Inference::PromptBuilder, 'PromptBuilder type available';
+};

@@ -1,0 +1,10 @@
+Revision history for LLM::Data::Inference
+
+{{$NEXT}}
+
+0.1.0  2026-04-07T18:52:19+01:00
+    - Initial release
+    - Task: blocking LLM calls with configurable parser and retry
+    - JSONTask: JSON extraction from LLM responses with key validation
+    - Router: query-based routing using Roaring::Tags
+    - PromptBuilder: mustache-style template rendering

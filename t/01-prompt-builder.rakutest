@@ -1,0 +1,52 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Inference::PromptBuilder;
+
+plan 7;
+
+subtest 'Simple substitution' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template('Hello, {{name}}!'));
+	is $pb.render(%(:name('Alice'))), 'Hello, Alice!', 'Single variable replaced';
+};
+
+subtest 'Multiple variables' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(
+		:template('{{greeting}}, {{name}}! You are {{age}} years old.')
+	);
+	is $pb.render(%(:greeting('Hi'), :name('Bob'), :age('30'))),
+		'Hi, Bob! You are 30 years old.', 'Multiple variables replaced';
+};
+
+subtest 'Missing variable dies' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template('Hello, {{name}}!'));
+	dies-ok { $pb.render(%()) }, 'Dies on missing variable';
+};
+
+subtest 'Unused variables ignored' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template('Hello!'));
+	is $pb.render(%(:extra('ignored'))), 'Hello!', 'Extra vars ignored';
+};
+
+subtest 'Empty template' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template(''));
+	is $pb.render(%()), '', 'Empty template returns empty';
+};
+
+subtest 'No variables returns as-is' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(:template('Plain text.'));
+	is $pb.render(%()), 'Plain text.', 'No placeholders returns template as-is';
+};
+
+subtest 'Same variable used twice' => {
+	plan 1;
+	my LLM::Data::Inference::PromptBuilder $pb .= new(
+		:template('{{x}} and {{x}} again')
+	);
+	is $pb.render(%(:x('foo'))), 'foo and foo again', 'Repeated variable works';
+};
