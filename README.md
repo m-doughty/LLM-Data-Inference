@@ -36,8 +36,8 @@ my $pb = LLM::Data::Inference::PromptBuilder.new(
 say $pb.render(%(:genre('fantasy'), :topic('dragons')));
 
 # Query-based routing
-my $router = LLM::Data::Inference::Router.new(:default-backend($claude));
-$router.add-route('nsfw OR violent OR gore', $local-uncensored);
+my $router = LLM::Data::Inference::Router.new(:default-backend($cloud-api));
+$router.add-route('confidential OR restricted', $local-model);
 $router.add-route('genre:technical', $reasoning-model);
 
 my $backend = $router.select-backend($tags, $doc-id);
@@ -90,13 +90,12 @@ Query-based routing using Roaring::Tags. Each route is a tag query string paired
 
 ```raku
 my $router = LLM::Data::Inference::Router.new(
-    :default-backend($safe-model),
+    :default-backend($cloud-api),
 );
 
-$router.add-route('nsfw', $uncensored-local);
-$router.add-route('nsfw, violent', $specialized-model);
+$router.add-route('confidential', $local-model);
+$router.add-route('confidential, sensitive', $air-gapped-model);
 $router.add-route('genre:technical', $reasoning-model);
-$router.add-route('nsfw OR violent OR gore', $unrestricted);
 
 my $backend = $router.select-backend($tags, $doc-id);
 ```

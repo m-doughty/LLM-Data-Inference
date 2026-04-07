@@ -2,6 +2,9 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.1.3  2026-04-07T20:03:42+01:00
+    - Updated readme examples to use generic routing terms
+
 0.1.2  2026-04-07T20:00:40+01:00
     - Removed Windows from CI (upstream Digest::SHA256::Native does not build on Windows)
 
