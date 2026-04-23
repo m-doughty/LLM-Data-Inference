@@ -55,37 +55,37 @@ subtest 'JSON wrapped in prose extracted' => {
 	is $task.execute<key>, 'value', 'JSON extracted from prose';
 };
 
-subtest 'Required keys validated' => {
+subtest 'Required keys missing advances to next backend' => {
 	plan 1;
-	my MockBackend $b = mock-backend('{"name":"Alice"}', '{"name":"Bob","age":25}');
+	my MockBackend $b1 = mock-backend('{"name":"Alice"}');
+	my MockBackend $b2 = mock-backend('{"name":"Bob","age":25}');
 	my LLM::Data::Inference::JSONTask $task .= new(
-		:backend($b), :user-prompt('Need name and age'),
+		:backends($b1, $b2), :user-prompt('Need name and age'),
 		:required-keys('name', 'age'),
-		:max-retries(3),
 	);
 	my $result = $task.execute;
-	is $result<age>, 25, 'Retried until required keys present';
+	is $result<age>, 25, 'Advanced until required keys present';
 };
 
-subtest 'Custom validator called' => {
+subtest 'Custom validator failure advances to next backend' => {
 	plan 1;
-	my MockBackend $b = mock-backend('{"score":5}', '{"score":15}');
+	my MockBackend $b1 = mock-backend('{"score":5}');
+	my MockBackend $b2 = mock-backend('{"score":15}');
 	my LLM::Data::Inference::JSONTask $task .= new(
-		:backend($b), :user-prompt('High score'),
-		:max-retries(3),
+		:backends($b1, $b2), :user-prompt('High score'),
 		:validator(-> %h { %h<score> > 10 }),
 	);
-	is $task.execute<score>, 15, 'Retried until validator passed';
+	is $task.execute<score>, 15, 'Advanced until validator passed';
 };
 
-subtest 'Invalid JSON triggers retry' => {
+subtest 'Invalid JSON advances to next backend' => {
 	plan 1;
-	my MockBackend $b = mock-backend('not json at all', '{"valid":true}');
+	my MockBackend $b1 = mock-backend('not json at all');
+	my MockBackend $b2 = mock-backend('{"valid":true}');
 	my LLM::Data::Inference::JSONTask $task .= new(
-		:backend($b), :user-prompt('JSON please'),
-		:max-retries(3),
+		:backends($b1, $b2), :user-prompt('JSON please'),
 	);
-	ok $task.execute<valid>, 'Retried past invalid JSON';
+	ok $task.execute<valid>, 'Advanced past invalid JSON';
 };
 
 subtest 'Array JSON response' => {
@@ -99,12 +99,13 @@ subtest 'Array JSON response' => {
 	is $result.elems, 3, 'Three elements';
 };
 
-subtest 'All retries fail dies' => {
+subtest 'Exhausted backend chain dies' => {
 	plan 1;
-	my MockBackend $b = mock-backend('garbage', 'more garbage', 'still garbage');
+	my MockBackend $b1 = mock-backend('garbage');
+	my MockBackend $b2 = mock-backend('more garbage');
+	my MockBackend $b3 = mock-backend('still garbage');
 	my LLM::Data::Inference::JSONTask $task .= new(
-		:backend($b), :user-prompt('Never valid'),
-		:max-retries(3),
+		:backends($b1, $b2, $b3), :user-prompt('Never valid'),
 	);
-	dies-ok { $task.execute }, 'Dies after all retries fail';
+	dies-ok { $task.execute }, 'Dies after every backend returns unparseable text';
 };

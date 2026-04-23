@@ -1,0 +1,228 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+plan 13;
+
+sub mock-ok(Str $text) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => [$text],
+	);
+}
+
+sub mock-failing(%error-hash) {
+	# Error-producer returns the same hash for every call so the Task's
+	# retry-same budget can exercise repeated failures. For per-call
+	# variation, tests should instantiate Mock directly with a custom
+	# error-producer closure — see "Connection error retries same
+	# backend before advancing" below.
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['(unreachable)'],
+		error-producer => -> $call-idx { %error-hash },
+	);
+}
+
+# --- classify-error direct tests --------------------------------------
+
+subtest 'classify-error: 4xx auth codes abort' => {
+	plan 5;
+	my $t = LLM::Data::Inference::Task.new(
+		backend => mock-ok('x'), user-prompt => 'q',
+	);
+	for 400, 401, 402, 403, 404 -> $s {
+		is $t.classify-error(error-class => 'http', error-status => $s),
+		   'abort', "HTTP $s → abort";
+	}
+};
+
+subtest 'classify-error: 429 + timeout + malformed → advance' => {
+	plan 4;
+	my $t = LLM::Data::Inference::Task.new(
+		backend => mock-ok('x'), user-prompt => 'q',
+	);
+	is $t.classify-error(error-class => 'http', error-status => 429),
+	   'advance', '429 → advance';
+	is $t.classify-error(error-class => 'timeout'),
+	   'advance', 'timeout → advance';
+	is $t.classify-error(error-class => 'response'),
+	   'advance', 'response (malformed/empty) → advance';
+	is $t.classify-error(parser-failed => True),
+	   'advance', 'parser-failed → advance';
+};
+
+subtest 'classify-error: 5xx + connection + unknown → retry-same' => {
+	plan 5;
+	my $t = LLM::Data::Inference::Task.new(
+		backend => mock-ok('x'), user-prompt => 'q',
+	);
+	is $t.classify-error(error-class => 'http', error-status => 500),
+	   'retry-same', '500 → retry-same';
+	is $t.classify-error(error-class => 'http', error-status => 503),
+	   'retry-same', '503 → retry-same';
+	is $t.classify-error(error-class => 'http', error-status => 599),
+	   'retry-same', '599 → retry-same';
+	is $t.classify-error(error-class => 'connection'),
+	   'retry-same', 'connection → retry-same';
+	is $t.classify-error(error-class => 'unknown'),
+	   'retry-same', 'unknown → retry-same';
+};
+
+# --- Abort bucket: no fallback iteration -----------------------------
+
+subtest '4xx auth error aborts immediately without trying fallbacks' => {
+	plan 3;
+	my $primary = mock-failing({ class => 'http', status => 401, message => 'bad key' });
+	my $fallback = mock-ok('should not be reached');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback], user-prompt => 'q',
+	);
+	dies-ok { $task.execute }, 'dies on 401';
+	is $primary.call-index,  1, 'primary hit once';
+	is $fallback.call-index, 0, 'fallback NOT hit (abort before advancing)';
+};
+
+subtest '402 payment-required aborts' => {
+	plan 2;
+	my $primary = mock-failing({ class => 'http', status => 402, message => 'top up' });
+	my $fallback = mock-ok('nope');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback], user-prompt => 'q',
+	);
+	dies-ok { $task.execute }, 'dies on 402';
+	is $fallback.call-index, 0, '402 does not cascade to fallback';
+};
+
+# --- Advance bucket: one shot per backend ----------------------------
+
+subtest 'Timeout advances to next backend without retrying same' => {
+	plan 3;
+	my $primary  = mock-failing({ class => 'timeout', message => 'timed out' });
+	my $fallback = mock-ok('from fallback');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback], user-prompt => 'q',
+	);
+	is $task.execute, 'from fallback', 'fallback served the response';
+	is $primary.call-index,  1, 'primary called exactly once (no same-model retry on timeout)';
+	is $fallback.call-index, 1, 'fallback called exactly once';
+};
+
+subtest '429 rate-limit advances to next backend' => {
+	plan 2;
+	my $primary  = mock-failing({ class => 'http', status => 429, message => 'slow down' });
+	my $fallback = mock-ok('from fallback');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback], user-prompt => 'q',
+	);
+	is $task.execute, 'from fallback', 'fallback served the response';
+	is $primary.call-index, 1, '429 does not burn same-model retries';
+};
+
+# --- Retry-same bucket: budget across max-retries --------------------
+
+subtest '5xx triggers same-model retry up to max-retries, then advances' => {
+	plan 3;
+	# Primary fails with 503 on every call (error-producer returns same hash);
+	# with max-retries=2 it gets 1 initial + 1 retry = 2 attempts, then advance.
+	my $primary  = mock-failing({ class => 'http', status => 503, message => 'bad gateway' });
+	my $fallback = mock-ok('recovered');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback],
+		user-prompt => 'q',
+		max-retries => 2,
+	);
+	is $task.execute, 'recovered', 'fallback served after primary exhausted';
+	is $primary.call-index,  2, 'primary called max-retries times (initial + 1 retry)';
+	is $fallback.call-index, 1, 'fallback called once after primary exhausted';
+};
+
+subtest 'Connection error retries same backend before advancing' => {
+	plan 2;
+	# First call fails with connection reset, second call succeeds.
+	my $i = 0;
+	my $primary = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['recovered from transient'],
+		error-producer => -> $call-idx {
+			$call-idx == 0 ?? { class => 'connection', message => 'ECONNRESET' } !! Nil
+		},
+	);
+	my $fallback = mock-ok('should not be reached');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$primary, $fallback], user-prompt => 'q',
+		max-retries => 3,
+	);
+	is $task.execute, 'recovered from transient', 'same-model retry succeeded';
+	is $fallback.call-index, 0, 'fallback not needed when same-model retry works';
+};
+
+# --- End-to-end multi-backend chain ----------------------------------
+
+subtest 'Three-backend chain: timeout → parser failure → success' => {
+	plan 4;
+	my $b1 = mock-failing({ class => 'timeout', message => 'timed out' });
+	my $b2 = mock-ok('bad JSON');
+	my $b3 = mock-ok('{"answer": 42}');
+	my $task = LLM::Data::Inference::JSONTask.new(
+		backends      => [$b1, $b2, $b3],
+		user-prompt   => 'q',
+		required-keys => ('answer',),
+	);
+	my $result = $task.execute;
+	is $result<answer>, 42,    'third backend produced parseable JSON';
+	is $b1.call-index,  1,     'first backend tried once';
+	is $b2.call-index,  1,     'second backend tried once';
+	is $b3.call-index,  1,     'third backend tried once';
+};
+
+subtest 'All backends exhausted dies with summary' => {
+	plan 2;
+	my $b1 = mock-failing({ class => 'timeout' });
+	my $b2 = mock-failing({ class => 'http', status => 502 });
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$b1, $b2], user-prompt => 'q',
+		max-retries => 1,
+	);
+	my $died = False;
+	my $msg;
+	try {
+		$task.execute;
+		CATCH { default { $died = True; $msg = ~$_.message } }
+	}
+	ok $died, 'dies when every backend fails';
+	like $msg, /'exhausted'/, 'error message mentions exhaustion';
+};
+
+# --- Backward compat ---------------------------------------------------
+
+subtest 'Single :backend still works (backward compat)' => {
+	plan 2;
+	my $b = mock-ok('direct response');
+	my $task = LLM::Data::Inference::Task.new(
+		backend => $b, user-prompt => 'q',
+	);
+	is $task.execute, 'direct response', 'legacy :backend shape returns response';
+	is $task.backend.WHICH, $b.WHICH,    '$.backend accessor still points at head';
+};
+
+# --- Telemetry: per-backend identification ---------------------------
+
+subtest 'Telemetry identifies which backend served each call' => {
+	plan 4;
+	my @hook-calls;
+	my $b1 = mock-failing({ class => 'timeout' });
+	my $b2 = mock-ok('from b2');
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [$b1, $b2], user-prompt => 'q',
+		on-call-complete => -> %p { @hook-calls.push: %p },
+	);
+	$task.execute;
+	is @hook-calls.elems,               2,       'two fires — one per backend';
+	is @hook-calls[0]<backend-index>,   0,       'first fire tagged backend 0';
+	is @hook-calls[1]<backend-index>,   1,       'second fire tagged backend 1';
+	is @hook-calls[0]<error-class>,     'timeout', 'failure fire carries error-class';
+};

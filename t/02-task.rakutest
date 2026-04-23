@@ -49,7 +49,7 @@ sub mock-backend(*@responses --> MockBackend:D) {
 	);
 }
 
-plan 6;
+plan 11;
 
 subtest 'Execute with no parser returns raw string' => {
 	plan 1;
@@ -70,21 +70,24 @@ subtest 'Execute with parser returns parsed result' => {
 	is $task.execute, 42, 'Parser applied';
 };
 
-subtest 'Parser failure triggers retry' => {
-	plan 1;
-	# First response fails parse, second succeeds
-	my MockBackend $b = mock-backend('bad', '42');
+subtest 'Parser failure advances to next backend' => {
+	plan 2;
+	# Primary returns bad text; fallback returns parseable. Parser
+	# failures no longer retry the same model — they advance, so this
+	# must cross a backend boundary to succeed.
+	my MockBackend $b1 = mock-backend('bad');
+	my MockBackend $b2 = mock-backend('42');
 	my Int:D $parse-count = 0;
 	my LLM::Data::Inference::Task $task .= new(
-		:backend($b), :user-prompt('Number please'),
-		:max-retries(3),
+		:backends($b1, $b2), :user-prompt('Number please'),
 		:parser(-> Str $s {
 			$parse-count++;
 			die "not a number" unless $s ~~ /^\d+$/;
 			$s.Int;
 		}),
 	);
-	is $task.execute, 42, 'Retried and got valid result';
+	is $task.execute, 42, 'Advanced and got valid result';
+	is $parse-count, 2,   'Parser invoked once per backend';
 };
 
 subtest 'Retries exhausted dies' => {
@@ -120,4 +123,131 @@ subtest 'Execute returns on first success without extra retries' => {
 	);
 	$task.execute;
 	is $call-count, 1, 'Parser called only once on success';
+};
+
+# --- Flaky backend: fails N times with a transient error then succeeds.
+# Simulates stream resets / connection drops. The Response's err is
+# set via .quit so is-success is False and the Task's
+# call-blocking dies with "LLM call failed: <err>".
+
+class FlakyBackend is LLM::Chat::Backend {
+	has Int:D $.fail-times is required;
+	has Str:D $.on-success is required;
+	has Str:D $.error-msg = 'stream reset';
+	has Int $!calls = 0;
+
+	method chat-completion(
+		@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+		--> LLM::Chat::Backend::Response
+	) {
+		my $n = ++$!calls;
+		my $r = LLM::Chat::Backend::Response.new(:id(uuid-v4()));
+		start {
+			if $n <= $!fail-times {
+				$r.quit($!error-msg);
+			} else {
+				$r.emit($!on-success);
+				$r.done;
+			}
+		}
+		$r;
+	}
+	method chat-completion-stream(@m, --> LLM::Chat::Backend::Response) { self.chat-completion(@m) }
+	method text-completion(@m, Bool $c = False, --> LLM::Chat::Backend::Response) { self.chat-completion(@m) }
+	method text-completion-stream(@m, Bool $c = False, --> LLM::Chat::Backend::Response) { self.chat-completion(@m) }
+	method cancel(LLM::Chat::Backend::Response $r) { $r.cancel }
+	method calls(--> Int) { $!calls }
+}
+
+subtest 'Network error triggers backoff-retry and eventually succeeds' => {
+	plan 2;
+	# Two transient errors then success — with max-retries=3 we should
+	# succeed on the third attempt. To keep the test fast we stub out
+	# long backoff waits: the default base-2 exponential produces
+	# 1s + 2s waits = ~3s extra, which is fine for CI.
+	my $b = FlakyBackend.new(
+		:fail-times(2),
+		:on-success('done'),
+		:settings(LLM::Chat::Backend::Settings.new),
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		:backend($b), :user-prompt('flaky test'),
+		:max-retries(3),
+	);
+	is $task.execute, 'done', 'Succeeded after two transient failures';
+	is $b.calls, 3, 'Exactly three backend calls — two failures + one success';
+};
+
+subtest 'Network error that never recovers dies after max-retries' => {
+	plan 2;
+	my $b = FlakyBackend.new(
+		:fail-times(100),         # always fails within any sensible retry count
+		:on-success('unused'),
+		:settings(LLM::Chat::Backend::Settings.new),
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		:backend($b), :user-prompt('hopeless'),
+		:max-retries(2),           # low to keep the test fast
+	);
+	dies-ok { $task.execute }, 'Dies when every attempt fails';
+	is $b.calls, 2, 'Stopped at max-retries without infinite retry';
+};
+
+subtest 'on-call-complete fires once per network call (success path)' => {
+	plan 5;
+	my @hook-calls;
+	my $b = mock-backend('hello');
+	my $task = LLM::Data::Inference::Task.new(
+		:backend($b), :user-prompt('Say hello'),
+		:on-call-complete(-> %p { @hook-calls.push: %p }),
+	);
+	$task.execute;
+	is @hook-calls.elems, 1,             'exactly one hook fire';
+	is @hook-calls[0]<attempt>, 1,       'attempt=1 on first success';
+	is @hook-calls[0]<success>, True,    'success flag True';
+	is @hook-calls[0]<stage>, 'network', 'stage=network';
+	ok @hook-calls[0]<latency-ms> >= 0,  'latency-ms is non-negative';
+};
+
+subtest 'on-call-complete fires on each backend in a fallback chain' => {
+	plan 6;
+	my @hook-calls;
+	# Primary returns bad text; fallback returns parseable. Each
+	# backend contributes one hook fire.
+	my $b1 = mock-backend('bad');
+	my $b2 = mock-backend('42');
+	my $task = LLM::Data::Inference::Task.new(
+		:backends($b1, $b2), :user-prompt('Number please'),
+		:parser(-> Str $s {
+			die "not a number" unless $s ~~ /^\d+$/;
+			$s.Int;
+		}),
+		:on-call-complete(-> %p { @hook-calls.push: %p }),
+	);
+	is $task.execute, 42, 'advanced and got valid result';
+	is @hook-calls.elems, 2,              'two hook fires — one per backend';
+	is @hook-calls[0]<attempt>, 1,        'first fire is attempt=1';
+	is @hook-calls[1]<attempt>, 2,        'second fire is attempt=2';
+	is @hook-calls[0]<backend-index>, 0,  'first fire is backend 0';
+	is @hook-calls[1]<backend-index>, 1,  'second fire is backend 1';
+};
+
+subtest 'on-call-complete fires even on network failure' => {
+	plan 4;
+	my @hook-calls;
+	my $b = FlakyBackend.new(
+		:fail-times(2),
+		:on-success('done'),
+		:settings(LLM::Chat::Backend::Settings.new),
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		:backend($b), :user-prompt('flaky'),
+		:max-retries(3),
+		:on-call-complete(-> %p { @hook-calls.push: %p }),
+	);
+	is $task.execute, 'done', 'succeeded after two failures';
+	is @hook-calls.elems, 3,               'three hook fires — two failures + one success';
+	is @hook-calls[0]<success>, False,     'first fire is a failure';
+	like @hook-calls[0]<error>, /'stream reset' | 'LLM call failed'/,
+	                                       'failure fire carries the error message';
 };
