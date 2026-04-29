@@ -1,0 +1,115 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
+use LLM::Chat::Backend::Settings;
+
+# Pins the on-call-complete hook payload contract for the
+# Response::OpenRouter rename (provider-id → generation-id) and the
+# new keys that come along with it (provider-name, is-byok). Also
+# checks that non-OR Response backends don't see those keys at all.
+
+plan 4;
+
+sub or-mock(*%fake) {
+    LLM::Chat::Backend::Mock.new(
+        settings              => LLM::Chat::Backend::Settings.new,
+        responses             => ['ok'],
+        response-class        => LLM::Chat::Backend::Response::OpenRouter,
+        stream-response-class => LLM::Chat::Backend::Response::OpenRouter::Stream,
+        fake-usage            => %fake,
+    );
+}
+
+sub base-mock(*%fake) {
+    LLM::Chat::Backend::Mock.new(
+        settings   => LLM::Chat::Backend::Settings.new,
+        responses  => ['ok'],
+        fake-usage => %fake,
+    );
+}
+
+subtest 'OR Response → hook payload carries generation-id, not provider-id' => {
+    plan 6;
+    my @hook-calls;
+    my $task = LLM::Data::Inference::Task.new(
+        backend => or-mock(
+            prompt        => 50,
+            completion    => 12,
+            cost          => 0.0017e0,
+            generation-id => 'gen-or-001',
+            provider-name => 'Anthropic',
+            is-byok       => False,
+        ),
+        user-prompt      => 'q',
+        on-call-complete => -> %p { @hook-calls.push: %p },
+    );
+    $task.execute;
+    is @hook-calls.elems,                1,             'one hook fire';
+    is @hook-calls[0]<cost>,             0.0017e0,      'cost in payload';
+    is @hook-calls[0]<generation-id>,    'gen-or-001',  'generation-id in payload';
+    is @hook-calls[0]<provider-name>,    'Anthropic',   'provider-name in payload';
+    is @hook-calls[0]<is-byok>,          False,         'is-byok in payload';
+    nok @hook-calls[0]<provider-id>:exists,            'provider-id key removed';
+};
+
+subtest 'OAI-spec keys still flow alongside OR extras' => {
+    plan 4;
+    my @hook-calls;
+    my $task = LLM::Data::Inference::Task.new(
+        backend => or-mock(
+            prompt     => 70,
+            completion => 22,
+            total      => 92,
+            model      => 'anthropic/claude-opus-4-7',
+            cost       => 0.0033e0,
+        ),
+        user-prompt      => 'q',
+        on-call-complete => -> %p { @hook-calls.push: %p },
+    );
+    $task.execute;
+    is @hook-calls[0]<prompt-tokens>,     70,                          'OAI prompt-tokens lifted';
+    is @hook-calls[0]<completion-tokens>, 22,                          'OAI completion-tokens lifted';
+    is @hook-calls[0]<total-tokens>,      92,                          'OAI total-tokens lifted';
+    is @hook-calls[0]<model-used>,        'anthropic/claude-opus-4-7', 'OAI model-used lifted';
+};
+
+subtest 'Base Response → OR keys absent from payload' => {
+    plan 5;
+    my @hook-calls;
+    my $task = LLM::Data::Inference::Task.new(
+        backend => base-mock(
+            prompt     => 30,
+            completion => 8,
+            model      => 'mock/base',
+        ),
+        user-prompt      => 'q',
+        on-call-complete => -> %p { @hook-calls.push: %p },
+    );
+    $task.execute;
+    is @hook-calls[0]<prompt-tokens>, 30,             'OAI keys present';
+    is @hook-calls[0]<model-used>,    'mock/base',    'OAI model-used present';
+    nok @hook-calls[0]<cost>:exists,                 'cost absent on base Response';
+    nok @hook-calls[0]<generation-id>:exists,        'generation-id absent on base Response';
+    nok @hook-calls[0]<provider-name>:exists,        'provider-name absent on base Response';
+};
+
+subtest 'OR Response with no fake-usage extras leaves keys absent' => {
+    plan 4;
+    my @hook-calls;
+    # OR Response, but the backend doesn't simulate any usage data —
+    # presence-gating means the keys stay out of the payload entirely.
+    my $task = LLM::Data::Inference::Task.new(
+        backend => or-mock(),
+        user-prompt      => 'q',
+        on-call-complete => -> %p { @hook-calls.push: %p },
+    );
+    $task.execute;
+    nok @hook-calls[0]<cost>:exists,                 'cost absent without fake-usage';
+    nok @hook-calls[0]<generation-id>:exists,        'generation-id absent without fake-usage';
+    nok @hook-calls[0]<provider-name>:exists,        'provider-name absent without fake-usage';
+    nok @hook-calls[0]<is-byok>:exists,              'is-byok absent without fake-usage';
+};

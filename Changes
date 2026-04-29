@@ -2,6 +2,22 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.3.0  2026-04-29T23:49:54+01:00
+    - Bump Github Actions to use node 24+
+    - BREAKING (telemetry payload): the on-call-complete hook payload
+      key C<:provider-id> is removed and replaced with C<:generation-id>
+      (clearer name — the value was always OpenRouter's gen-XXXX id,
+      not a provider name). New keys C<:provider-name> and C<:is-byok>
+      are added alongside, lifted off
+      C<LLM::Chat::Backend::Response::OpenRouter> when present. Reads
+      now use C<.?> so non-OR Response subclasses (which have no such
+      accessors) don't blow up — they simply omit the keys.
+    - Sink contract is otherwise unchanged: every key remains
+      presence-gated (absent when the provider didn't supply it).
+      Migrating sinks: rename C<%payload<provider-id>> →
+      C<%payload<generation-id>>; optionally consume the new
+      C<provider-name> / C<is-byok> keys for richer routing visibility.
+
 0.2.0  2026-04-23T15:57:28+01:00
     - Added auth specifiers to META6.json dependencies
     - Task + JSONTask accept an ordered :@backends fallback chain in

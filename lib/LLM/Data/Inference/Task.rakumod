@@ -128,9 +128,15 @@ has Num:D $.timeout = 120e0;
       * error-class    — Str, Task-side classification (see module Pod)
       * error-status   — Int, HTTP status when error-class eq 'http'
       * stage          — 'network'
-      * prompt-tokens / completion-tokens / total-tokens / cost /
-        model-used / provider-id / finish-reason — presence-gated,
-        lifted off the Response when the provider supplies them. )
+      * prompt-tokens / completion-tokens / total-tokens /
+        model-used / finish-reason — presence-gated, lifted off
+        any C<LLM::Chat::Backend::Response> when the provider
+        supplies them.
+      * cost / generation-id / provider-name / is-byok —
+        presence-gated, lifted off Response subclasses that expose
+        them (currently C<LLM::Chat::Backend::Response::OpenRouter>).
+        On other backends these keys are simply absent from the
+        payload. )
 has &.on-call-complete;
 
 submethod TWEAK() {
@@ -367,13 +373,20 @@ method !fire-telemetry(
 	);
 	my $r = %call<response>;
 	if $r.defined {
+		# OAI-spec usage — present on any LLM::Chat::Backend::Response.
 		%payload<prompt-tokens>     = $r.prompt-tokens     if $r.prompt-tokens.defined;
 		%payload<completion-tokens> = $r.completion-tokens if $r.completion-tokens.defined;
 		%payload<total-tokens>      = $r.total-tokens      if $r.total-tokens.defined;
-		%payload<cost>              = $r.cost              if $r.cost.defined;
 		%payload<model-used>        = $r.model-used        if $r.model-used.defined;
-		%payload<provider-id>       = $r.provider-id       if $r.provider-id.defined;
 		%payload<finish-reason>     = $r.finish-reason     if $r.finish-reason.defined;
+		# Provider-specific extras — only on Response subclasses that
+		# expose them (e.g. LLM::Chat::Backend::Response::OpenRouter).
+		# `.?` returns Nil for Responses without the accessor, so the
+		# presence-gated contract below holds for any backend.
+		%payload<cost>           = $r.?cost           if $r.?cost.defined;
+		%payload<generation-id>  = $r.?generation-id  if $r.?generation-id.defined;
+		%payload<provider-name>  = $r.?provider-name  if $r.?provider-name.defined;
+		%payload<is-byok>        = $r.?is-byok        if $r.?is-byok.defined;
 	}
 	try {
 		&!on-call-complete(%payload);

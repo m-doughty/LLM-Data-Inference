@@ -122,9 +122,14 @@ Consumers on a single-backend Task that previously relied on parser recovery via
     error-class   => Str,       # 'http' / 'timeout' / 'connection' /
                                 # 'response' / 'unknown' (on failure)
     error-status  => Int,       # HTTP code (when error-class eq 'http')
-    # Provider-reported usage — presence-gated:
+    # OAI-spec usage — presence-gated, lifted off any
+    # LLM::Chat::Backend::Response when the provider supplies them:
     prompt-tokens, completion-tokens, total-tokens,
-    cost, model-used, provider-id, finish-reason,
+    model-used, finish-reason,
+    # Provider-specific extras — presence-gated, lifted off Response
+    # subclasses that expose them (currently
+    # LLM::Chat::Backend::Response::OpenRouter):
+    cost, generation-id, provider-name, is-byok,
 )
 ```
 
