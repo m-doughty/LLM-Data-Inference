@@ -1,0 +1,117 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# parse-retries: same-backend re-rolls on parser failures, plus raw
+# model output retention on the typed Exhausted exception.
+
+plan 5;
+
+sub mock-seq(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{');
+	$text;
+};
+
+subtest 'parse-retries re-rolls the same backend until output parses' => {
+	plan 2;
+	my $calls = 0;
+	my $task = LLM::Data::Inference::Task.new(
+		backend          => mock-seq('nope', 'still nope', '{"ok":true}'),
+		user-prompt      => 'q',
+		parser           => &json-parser,
+		parse-retries    => 2,
+		on-call-complete => -> %info { $calls++ },
+	);
+	is $task.execute, '{"ok":true}', 'third roll parses and is returned';
+	is $calls, 3, 'exactly three round-trips were made';
+};
+
+subtest 'default parse-retries=0 keeps the historical advance behaviour' => {
+	plan 2;
+	my $calls = 0;
+	my $task = LLM::Data::Inference::Task.new(
+		backend          => mock-seq('nope', '{"ok":true}'),
+		user-prompt      => 'q',
+		parser           => &json-parser,
+		on-call-complete => -> %info { $calls++ },
+	);
+	throws-like { $task.execute },
+		X::LLM::Data::Inference::Exhausted,
+		message => /'all 1 backend(s) exhausted'/,
+		'single malformed response exhausts a one-backend chain';
+	is $calls, 1, 'no same-backend re-roll happened';
+};
+
+subtest 'exhaustion carries every raw model output for parse failures' => {
+	plan 6;
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => mock-seq('first garbage', 'second garbage'),
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 1,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed exception thrown';
+	is $caught.attempts.elems, 2, 'both attempts recorded';
+	is $caught.attempts[0]<raw-text>, 'first garbage',
+		'first raw output retained';
+	is $caught.attempts[1]<raw-text>, 'second garbage',
+		'second raw output retained';
+	is $caught.attempts[0]<backend-index>, 0, 'backend index recorded';
+	like $caught.message, /'parser: not json'/,
+		'message keeps the aggregate error summary';
+};
+
+subtest 'network failures record attempts without raw-text' => {
+	plan 3;
+	my $backend = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['(unreachable)'],
+		error-producer => -> $call-idx {
+			%( class => 'timeout', message => 'timed out' )
+		},
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		backend => $backend, user-prompt => 'q', parser => &json-parser,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed exception thrown';
+	is $caught.attempts.elems, 1, 'one attempt recorded';
+	nok $caught.attempts[0]<raw-text>:exists,
+		'network failure has no raw-text key';
+};
+
+subtest 'JSONTask threads parse-retries through to the inner Task' => {
+	plan 1;
+	my $task = LLM::Data::Inference::JSONTask.new(
+		backend       => mock-seq('prose, no json here at all',
+			'{"name": "ok"}'),
+		user-prompt   => 'q',
+		required-keys => <name>,
+		parse-retries => 1,
+	);
+	is $task.execute<name>, 'ok', 're-roll produced the valid parse';
+};

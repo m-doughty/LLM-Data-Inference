@@ -33,7 +33,7 @@ sub mock-backend(*@responses --> MockBackend:D) {
 	MockBackend.new(:@responses, :settings(LLM::Chat::Backend::Settings.new));
 }
 
-plan 7;
+plan 8;
 
 subtest 'Valid JSON parsed correctly' => {
 	plan 2;
@@ -108,4 +108,54 @@ subtest 'Exhausted backend chain dies' => {
 		:backends($b1, $b2, $b3), :user-prompt('Never valid'),
 	);
 	dies-ok { $task.execute }, 'Dies after every backend returns unparseable text';
+};
+
+subtest 'Extraction hardening: reasoning chatter, fences, plan-out-loud' => {
+	plan 6;
+
+	sub run-one(Str:D $response) {
+		my MockBackend $b = mock-backend($response);
+		LLM::Data::Inference::JSONTask.new(
+			:backend($b), :user-prompt('Give me JSON'),
+		).execute;
+	}
+
+	is run-one(qq:to/END/)<events>[0]<kind>, 'mood_delta',
+		Sure! Here's the JSON:
+		```json
+		\{"events": [\{"kind": "mood_delta"}]}
+		```
+		Let me know if you need anything else.
+		END
+		'code-fenced JSON extracted';
+
+	is run-one(q:to/END/)<answer>, 42,
+		<think>
+		The user wants JSON. I should structure it as { key: value }
+		— wait, arrays [ maybe? No, an object.
+		</think>
+		{"answer": 42}
+		END
+		'think-block with stray braces stripped before extraction';
+
+	is run-one(q:to/END/)<events>[0], 'real',
+		Let me sketch the shape first: {"draft": true} — okay, now
+		the full answer with everything filled in properly:
+		{"events": ["real"], "detail": "the actual full response body"}
+		END
+		'plan-out-loud: the longer complete object wins over the draft';
+
+	is run-one('{"text": "a } inside a string", "n": 1}')<n>, 1,
+		'braces inside JSON strings do not confuse the balanced scan';
+
+	is run-one("prose [1, 2, 3] more prose")[2], 3,
+		'top-level arrays still extract from prose';
+
+	# Truncated output (no complete structure anywhere) falls back to
+	# the legacy slice, which from-json rejects → chain exhausts with
+	# the established parser error.
+	throws-like {
+		run-one('{"events": [{"kind": "mood_delta"')
+	}, Exception, message => /'backend(s) exhausted'/,
+		'truncated JSON still exhausts with a parser error';
 };

@@ -1,0 +1,162 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# Cooperative cancellation: the is-cancelled hook must stop the Task
+# at every decision point — before the first call, between retries /
+# re-rolls, mid-backoff, and mid-flight (aborting the pending
+# response) — throwing the typed Cancelled exception rather than
+# burning the retry chain.
+
+plan 6;
+
+sub mock-seq(*@responses, *%extra) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+		|%extra,
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{');
+	$text;
+};
+
+subtest 'absent or False hook leaves behaviour unchanged' => {
+	plan 2;
+	my $plain = LLM::Data::Inference::Task.new(
+		backend     => mock-seq('{"ok":true}'),
+		user-prompt => 'q',
+	);
+	is $plain.execute, '{"ok":true}', 'no hook: result returned';
+
+	my $false-hook = LLM::Data::Inference::Task.new(
+		backend      => mock-seq('{"ok":true}'),
+		user-prompt  => 'q',
+		is-cancelled => -> { False },
+	);
+	is $false-hook.execute, '{"ok":true}', 'False hook: result returned';
+};
+
+subtest 'cancelled before the first call: zero round-trips' => {
+	plan 3;
+	my $backend = mock-seq('never wanted');
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => $backend,
+		user-prompt  => 'q',
+		is-cancelled => -> { True },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Cancelled { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed Cancelled exception thrown';
+	is $backend.call-index, 0, 'no HTTP round-trip was made';
+	is $caught.attempts.elems, 0, 'no attempt records — nothing ran';
+};
+
+subtest 'cancel after a parse failure skips the re-roll' => {
+	plan 4;
+	my $backend = mock-seq('garbage', '{"ok":true}');
+	my Bool $cancel = False;
+	my $task = LLM::Data::Inference::Task.new(
+		backend          => $backend,
+		user-prompt      => 'q',
+		parser           => &json-parser,
+		parse-retries    => 2,
+		on-call-complete => -> %info { $cancel = True },
+		is-cancelled     => -> { $cancel },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Cancelled { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'Cancelled thrown instead of re-rolling';
+	is $backend.call-index, 1, 'exactly one round-trip — re-roll budget unspent';
+	is $caught.attempts.elems, 1, 'the failed parse attempt is on record';
+	is $caught.attempts[0]<raw-text>, 'garbage',
+		'raw model output retained for inspection';
+};
+
+subtest 'cancel mid-call aborts the in-flight response' => {
+	plan 3;
+	# 2 s of simulated latency; the hook flips True on the poll loop's
+	# first in-flight check (invocation 2 — invocation 1 was the loop
+	# top). Well under the latency budget proves the response was
+	# aborted, not waited out.
+	my $backend = mock-seq('slow answer', initial-delay => 2.0);
+	my Int $checks = 0;
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => $backend,
+		user-prompt  => 'q',
+		is-cancelled => -> { ++$checks >= 2 },
+	);
+	my $t0 = now;
+	throws-like { $task.execute },
+		X::LLM::Data::Inference::Cancelled,
+		'mid-flight cancel throws the typed exception';
+	ok now - $t0 < 1.0,
+		'returned well before the 2 s response latency — call was aborted';
+	is $backend.call-index, 1, 'the one in-flight call is all there was';
+};
+
+subtest 'cancel interrupts retry backoff' => {
+	plan 3;
+	# Every call fails retry-same-class; the first backoff is >= 1 s.
+	# The hook flips during the first call's telemetry, so the chunked
+	# backoff sleep must bail on its first check.
+	my $backend = mock-seq(
+		'unused',
+		error-producer => -> $i { { class => 'connection', message => 'ECONNRESET' } },
+	);
+	my Bool $cancel = False;
+	my $task = LLM::Data::Inference::Task.new(
+		backend          => $backend,
+		user-prompt      => 'q',
+		max-retries      => 3,
+		on-call-complete => -> %info { $cancel = True },
+		is-cancelled     => -> { $cancel },
+	);
+	my $t0 = now;
+	throws-like { $task.execute },
+		X::LLM::Data::Inference::Cancelled,
+		'cancel lands during backoff, not after it';
+	ok now - $t0 < 0.9,
+		'no full backoff sleep was served (first wait would be >= 1 s)';
+	is $backend.call-index, 1, 'no retry round-trip happened';
+};
+
+subtest 'is-cancelled threads through JSONTask' => {
+	plan 2;
+	my %ok = LLM::Data::Inference::JSONTask.new(
+		backend       => mock-seq('{"a":1}'),
+		user-prompt   => 'q',
+		required-keys => <a>,
+		is-cancelled  => -> { False },
+	).execute;
+	is %ok<a>, 1, 'False hook: JSON parsed and returned';
+
+	my $backend = mock-seq('{"a":1}');
+	throws-like {
+		LLM::Data::Inference::JSONTask.new(
+			backend       => $backend,
+			user-prompt   => 'q',
+			required-keys => <a>,
+			is-cancelled  => -> { True },
+		).execute;
+	}, X::LLM::Data::Inference::Cancelled,
+		'True hook: inner Task throws before any call';
+};
+
+done-testing;

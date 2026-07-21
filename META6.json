@@ -6,7 +6,7 @@
   "build-depends": [
   ],
   "depends": [
-    "LLM::Chat:auth<zef:apogee>",
+    "LLM::Chat:ver<0.7.0>:auth<zef:apogee>",
     "Roaring::Tags:auth<zef:apogee>",
     "CRoaring:auth<zef:apogee>",
     "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
@@ -17,6 +17,7 @@
   "perl": "6.d",
   "provides": {
     "LLM::Data::Inference": "lib/LLM/Data/Inference.rakumod",
+    "LLM::Data::Inference::Exceptions": "lib/LLM/Data/Inference/Exceptions.rakumod",
     "LLM::Data::Inference::JSONTask": "lib/LLM/Data/Inference/JSONTask.rakumod",
     "LLM::Data::Inference::PromptBuilder": "lib/LLM/Data/Inference/PromptBuilder.rakumod",
     "LLM::Data::Inference::Router": "lib/LLM/Data/Inference/Router.rakumod",
@@ -33,5 +34,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.3.0"
+  "version": "0.5.1"
 }

@@ -2,6 +2,50 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.5.1  2026-07-21T03:15:12+01:00
+    - [2026-07-19] Add C<:on-exhausted> to Task: an optional hook that
+      fires exactly once, on the execute thread, immediately before
+      C<X::LLM::Data::Inference::Exhausted> is thrown (never on
+      success, never on the Cancelled path). The payload carries the
+      same C<attempts> records and C<summary> string the thrown
+      exception carries, plus C<stage => 'exhausted'> and a
+      C<backends> count — letting callers (e.g. a pipeline DLQ) get
+      the rich attempts/raw-text payload without re-parsing the
+      caught exception. Shielded exactly like C<on-call-complete>: a
+      throwing hook is caught and noted, never suppressing or
+      altering the Exhausted throw. JSONTask now forwards
+      C<:on-exhausted> to its inner Task, same as its other hooks.
+    - [2026-07-04] Cooperative cancellation: Task and JSONTask accept
+      C<:is-cancelled>, polled before every round-trip, on each
+      in-flight completion poll (~10 ms cadence — the pending response
+      is aborted via Response.cancel, same as the timeout path), and
+      between chunked backoff sleeps. When the hook reports True the
+      Task throws the new typed X::LLM::Data::Inference::Cancelled,
+      which carries the same C<.attempts> records as Exhausted but is
+      deliberately NOT its subclass — a user cancel must never be
+      swallowed by exhaustion handlers. A cancelled Task no longer
+      burns the remaining retry chain (previously up to
+      max-retries x backends round-trips plus full backoff sleeps
+      after the caller had already walked away).
+    - [2026-07-03] Add C<:parse-retries> to Task and JSONTask: an
+      opt-in same-backend re-roll budget consumed only by parser
+      failures (default 0 keeps the historical advance-immediately
+      behaviour). Interactive callers on stochastic samplers re-roll
+      malformed JSON instead of exhausting the chain on one bad shot.
+    - [2026-07-03] Chain exhaustion now throws the typed
+      X::LLM::Data::Inference::Exhausted (new
+      LLM::Data::Inference::Exceptions module) whose C<.attempts>
+      records every failure — including the RAW model output for each
+      failed parse — while C<.message> keeps the exact historical
+      summary string for back-compat.
+    - [2026-07-03] Harden JSONTask extraction: strip <think> blocks and
+      markdown code-fence markers, then pick the longest complete
+      top-level JSON structure via a string-aware balanced-bracket
+      scan that actually parses (reasoning preambles with stray
+      braces, plan-out-loud draft objects, and fenced answers all
+      extract correctly). Hopeless responses fall back to the legacy
+      slice so established error messages are preserved.
+
 0.3.0  2026-04-29T23:49:54+01:00
     - Bump Github Actions to use node 24+
     - BREAKING (telemetry payload): the on-call-complete hook payload

@@ -1,0 +1,182 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# &.on-exhausted: fires once, immediately before Exhausted is thrown,
+# carrying the same attempts/summary the exception carries. Never
+# fires on success or on the Cancelled path; a throwing hook must be
+# shielded without altering the Exhausted throw.
+
+plan 6;
+
+sub mock-failing(%error-hash) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['(unreachable)'],
+		error-producer => -> $call-idx { %error-hash },
+	);
+}
+
+sub mock-ok(Str $text) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => [$text],
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{');
+	$text;
+};
+
+subtest 'fires exactly once on full exhaustion, payload matches the thrown exception' => {
+	plan 8;
+	my @hook-calls;
+	my $b1 = mock-failing({ class => 'timeout', message => 'timed out' });
+	my $b2 = mock-failing({ class => 'http', status => 502, message => 'bad gateway' });
+	my $task = LLM::Data::Inference::Task.new(
+		backends     => [$b1, $b2],
+		user-prompt  => 'q',
+		max-retries  => 1,
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed exception thrown';
+	is @hook-calls.elems, 1, 'hook fired exactly once';
+	my %info = @hook-calls[0];
+	is %info<stage>, 'exhausted', 'stage is exhausted';
+	is %info<backends>, 2, 'backends count matches chain length';
+	is %info<summary>, $caught.summary, 'summary matches the exception';
+	is %info<attempts>.elems, $caught.attempts.elems, 'attempts count matches';
+	my Bool $same-objects = so (0 ..^ %info<attempts>.elems).map({
+		%info<attempts>[$_] === $caught.attempts[$_]
+	}).all;
+	ok $same-objects,
+		'every record is the identical Hash the exception carries — same objects';
+	is %info<attempts>[0]<backend-index>, 0, 'first attempt tagged backend 0';
+};
+
+subtest 'parse-failure exhaustion includes raw-text in attempts' => {
+	plan 4;
+	my @hook-calls;
+	my $backend = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['first garbage', 'second garbage'],
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => $backend,
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 1,
+		on-exhausted  => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed exception thrown';
+	is @hook-calls.elems, 1, 'hook fired exactly once';
+	is @hook-calls[0]<attempts>[0]<raw-text>, 'first garbage',
+		'first raw output present in hook payload';
+	is @hook-calls[0]<attempts>[1]<raw-text>, 'second garbage',
+		'second raw output present in hook payload';
+};
+
+subtest 'hook NOT fired on success' => {
+	plan 2;
+	my @hook-calls;
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => mock-ok('all good'),
+		user-prompt  => 'q',
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	is $task.execute, 'all good', 'succeeds normally';
+	is @hook-calls.elems, 0, 'hook never fired on the success path';
+};
+
+subtest 'hook NOT fired on cancellation' => {
+	plan 3;
+	my @hook-calls;
+	my $backend = mock-ok('never wanted');
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => $backend,
+		user-prompt  => 'q',
+		is-cancelled => -> { True },
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Cancelled { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed Cancelled exception thrown';
+	is $backend.call-index, 0, 'no HTTP round-trip was made';
+	is @hook-calls.elems, 0, 'on-exhausted never fired on the Cancelled path';
+};
+
+subtest 'a hook that dies is shielded — Exhausted still thrown' => {
+	plan 3;
+	my $b1 = mock-failing({ class => 'timeout', message => 'timed out' });
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => $b1,
+		user-prompt  => 'q',
+		on-exhausted => -> %info { die "boom, broken hook" },
+	);
+	my $caught;
+	my $died = False;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+			default { $died = True }
+		}
+	}
+	ok $caught.defined, 'Exhausted still thrown despite the throwing hook';
+	nok $died, 'no other exception leaked out of execute';
+	like $caught.message, /'exhausted'/,
+		'exception summary is intact — the hook did not alter it';
+};
+
+subtest 'JSONTask forwards on-exhausted to the inner Task' => {
+	plan 5;
+	my @hook-calls;
+	my $b1 = mock-ok('not json at all');
+	my $b2 = mock-ok('still not json');
+	my $task = LLM::Data::Inference::JSONTask.new(
+		backends     => [$b1, $b2],
+		user-prompt  => 'q',
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
+		}
+	}
+	ok $caught.defined, 'typed exception thrown after the JSON chain exhausts';
+	is @hook-calls.elems, 1, 'hook fired exactly once';
+	my %info = @hook-calls[0];
+	is %info<stage>, 'exhausted', 'stage is exhausted';
+	is %info<attempts>[0]<raw-text>, 'not json at all',
+		'raw text of the first failed parse is present in the hook payload';
+	is %info<attempts>.elems, $caught.attempts.elems,
+		'payload attempts count matches the caught exception';
+};
+
+done-testing;
