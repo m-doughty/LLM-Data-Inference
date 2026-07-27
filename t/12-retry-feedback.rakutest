@@ -1,0 +1,270 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# Retry feedback: a parse re-roll is blind by default — same prompt,
+# same model, no hint about what was wrong with the last answer. Fine
+# for a stray comma on a stochastic sampler, useless for a semantic
+# rejection ("quote 2 does not appear verbatim"), which repeats
+# identically until the budget is gone and the item dead-letters.
+#
+# :retry-feedback appends ONE extra user turn naming the rejection to
+# the next attempt against the SAME backend. The contract these tests
+# pin down:
+#   * the appended turn's wording is exact and its position is last;
+#   * each re-roll REPLACES the previous feedback (never accumulates);
+#   * it is off by default;
+#   * it is produced by parse/validation failures ONLY — truncation
+#     advances, backend advances and network retry-sames all send a
+#     pristine prompt;
+#   * JSONTask threads the flag through, validator message included.
+#
+# Everything is asserted on Mock's recorded-calls (what actually
+# reached the backend), not on the shape of the result.
+
+plan 7;
+
+sub mock(*%extra) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['unused fallback'],
+		|%extra,
+	);
+}
+
+# Dies with a message a human (and a model) can act on — the whole
+# point of feedback is that the diagnostic names the fix.
+my &roster-parser = sub (Str:D $text) {
+	die "the roster key is missing" unless $text.contains('"roster"');
+	$text;
+};
+
+my Str:D $ROSTER-FEEDBACK =
+	"Your previous response was rejected: the roster key is missing. "
+	~ "Respond again with the same JSON contract, corrected.";
+
+#| The user turns that reached the backend on a given recorded call.
+sub contents($backend, Int:D $call) {
+	$backend.recorded-calls[$call]<messages>.map(*.content).List;
+}
+
+subtest 'an informed re-roll recovers where a blind one would not' => {
+	plan 7;
+	# The responder answers correctly ONLY when it can see the
+	# rejection: a model that needs to be told what was wrong. A blind
+	# re-roll of this same mock fails forever, which is exactly the
+	# live failure this flag exists to fix.
+	my $backend = mock(
+		responder => -> @msgs {
+			@msgs.elems == 2 && @msgs[*-1].content.contains('was rejected')
+				?? '{"roster": ["Mira"]}'
+				!! '{"cast": ["Mira"]}';
+		},
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		backend        => $backend,
+		user-prompt    => 'list the roster',
+		parser         => &roster-parser,
+		parse-retries  => 2,
+		retry-feedback => True,
+	);
+	is $task.execute, '{"roster": ["Mira"]}',
+		'the second, informed attempt produces the result';
+	is $backend.call-index, 2, 'exactly one re-roll was needed';
+
+	my @first = contents($backend, 0);
+	is @first.elems, 1, 'the FIRST call is pristine — nothing to feed back yet';
+	is @first[0], 'list the roster', '... just the user prompt';
+
+	my @second = contents($backend, 1);
+	is @second.elems, 2, 'the re-roll carries exactly one extra turn';
+	is $backend.recorded-calls[1]<messages>[1].role, 'user',
+		'... appended as a user turn (last position)';
+	is @second[1], $ROSTER-FEEDBACK,
+		'... whose wording is the canned feedback message, verbatim';
+};
+
+subtest 'each re-roll replaces the previous feedback, never accumulates' => {
+	plan 8;
+	# A system prompt is included so the message counts prove the
+	# append is positional and bounded: 2 pristine, 3 informed — never
+	# 4, which is what a growing transcript of complaints would give.
+	my $backend = mock(responses => ['A', 'B', 'C']);
+	my &parser = sub (Str:D $text) { die "error $text" };
+	my $task = LLM::Data::Inference::Task.new(
+		backend        => $backend,
+		system-prompt  => 'you are terse',
+		user-prompt    => 'q',
+		parser         => &parser,
+		parse-retries  => 2,
+		retry-feedback => True,
+	);
+	throws-like { $task.execute }, X::LLM::Data::Inference::Exhausted,
+		'all three attempts fail and the chain exhausts';
+	is $backend.call-index, 3, 'the full re-roll budget was spent';
+
+	is contents($backend, 0).elems, 2,
+		'call 1: system + user, pristine';
+
+	my @second = contents($backend, 1);
+	is @second.elems, 3, 'call 2: one appended turn';
+	ok @second[2].contains('error A'),
+		'... carrying the FIRST rejection';
+
+	my @third = contents($backend, 2);
+	is @third.elems, 3,
+		'call 3: still ONE appended turn — feedback replaced, not stacked';
+	ok @third[2].contains('error B'),
+		'... carrying the SECOND rejection';
+	nok @third[2].contains('error A'),
+		'... and no trace of the first, now-stale complaint';
+};
+
+subtest 'off by default — blind re-rolls are unchanged' => {
+	plan 4;
+	my $backend = mock(responses => ['nope', 'nope', 'nope']);
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => $backend,
+		user-prompt   => 'q',
+		parser        => &roster-parser,
+		parse-retries => 2,
+	);
+	throws-like { $task.execute }, X::LLM::Data::Inference::Exhausted,
+		'the chain still exhausts';
+	nok $task.retry-feedback, 'the attribute defaults to False';
+	is $backend.call-index, 3, 'three attempts, as before';
+	my Bool $all-pristine = so $backend.recorded-calls.map({
+		$_<messages>.elems == 1
+	}).all;
+	ok $all-pristine,
+		'every re-roll sent the identical single-turn prompt';
+};
+
+subtest 'a truncation advance never produces feedback' => {
+	plan 5;
+	# Truncation is a budget fact, not a mistake the model can correct
+	# by trying harder: max_tokens lives in the backend's Settings.
+	# Telling the next model "your predecessor was rejected" would be
+	# a lie about output it never saw.
+	my $small = mock(
+		responses              => ['{"roster": ["Mi'],
+		finish-reason-producer => -> $i { 'length' },
+	);
+	my $big = mock(responses => ['{"roster": ["Mira"]}']);
+	my $task = LLM::Data::Inference::Task.new(
+		backends       => [$small, $big],
+		user-prompt    => 'q',
+		parser         => &roster-parser,
+		parse-retries  => 2,
+		retry-feedback => True,
+	);
+	is $task.execute, '{"roster": ["Mira"]}',
+		'the larger-budget backend produces the result';
+	is $small.call-index, 1,
+		'the truncating backend was tried once — no informed re-roll';
+	is $big.call-index, 1, 'the fallback was reached immediately';
+	is contents($big, 0).elems, 1,
+		'the fallback got a pristine prompt';
+	nok contents($big, 0)[0].contains('was rejected'),
+		'... with no feedback smuggled into the user turn';
+};
+
+subtest 'feedback does not cross a backend advance' => {
+	plan 6;
+	# Within a backend, feedback flows. Across backends it must not:
+	# the next model has produced nothing yet, so its predecessor's
+	# mistakes are not evidence about anything it did.
+	my $first = mock(responses => ['no-keys-here', 'still-not-it']);
+	my $second = mock(responses => ['{"roster": []}']);
+	my $task = LLM::Data::Inference::Task.new(
+		backends       => [$first, $second],
+		user-prompt    => 'q',
+		parser         => &roster-parser,
+		parse-retries  => 1,
+		retry-feedback => True,
+	);
+	is $task.execute, '{"roster": []}', 'the second backend answers';
+	is $first.call-index, 2, 'backend 0 spent its one re-roll';
+	is contents($first, 0).elems, 1, 'backend 0 call 1: pristine';
+	is contents($first, 1).elems, 2,
+		'backend 0 call 2: informed — feedback works within a backend';
+	is $second.call-index, 1, 'backend 1 needed one call';
+	is contents($second, 0).elems, 1,
+		'backend 1 call 1: pristine — the slot died with backend 0';
+};
+
+subtest 'a network retry-same sends the same prompt it always did' => {
+	plan 4;
+	# A connection drop produced no output to critique, so there is
+	# nothing to feed back — the retry must be byte-identical to the
+	# call it replaces.
+	my $backend = mock(
+		responses      => ['{"roster": ["Mira"]}'],
+		error-producer => -> $i {
+			$i == 0 ?? { class => 'connection', message => 'ECONNRESET' } !! Nil;
+		},
+	);
+	my $task = LLM::Data::Inference::Task.new(
+		backend        => $backend,
+		user-prompt    => 'q',
+		parser         => &roster-parser,
+		parse-retries  => 2,
+		retry-feedback => True,
+	);
+	is $task.execute, '{"roster": ["Mira"]}',
+		'the retry-same recovers as before';
+	is $backend.call-index, 2, 'one failed call plus one retry';
+	is contents($backend, 0).elems, 1, 'the failed call: one turn';
+	is contents($backend, 1).elems, 1,
+		'the retry: still one turn — no feedback invented for it';
+};
+
+subtest 'JSONTask threads the flag through, validator message included' => {
+	plan 6;
+	# The case from the live run: a verbatim-quote validator whose
+	# diagnostic names the offending item. Blind re-rolls repeated the
+	# same welded-attribution mistake three times; the informed one
+	# fixes it.
+	my $backend = mock(
+		responder => -> @msgs {
+			@msgs[*-1].content.contains('was rejected')
+				?? '{"quotes": ["Why do you ask?"]}'
+				!! '{"quotes": ["Why do you ask? said Bram"]}';
+		},
+	);
+	my $task = LLM::Data::Inference::JSONTask.new(
+		backend        => $backend,
+		user-prompt    => 'extract the quotes',
+		required-keys  => <quotes>,
+		validator      => -> %h {
+			die "quote 1 does not appear verbatim in the passage"
+				if %h<quotes>[0].contains('said');
+			True;
+		},
+		parse-retries  => 1,
+		retry-feedback => True,
+	);
+	my %parsed = $task.execute;
+	is %parsed<quotes>[0], 'Why do you ask?',
+		'the corrected quote comes back parsed';
+	is $backend.call-index, 2, 'one informed re-roll';
+	is contents($backend, 0).elems, 1, 'the first call is pristine';
+	my @second = contents($backend, 1);
+	is @second.elems, 2, 'the re-roll carries the extra turn';
+	is @second[1],
+		"Your previous response was rejected: quote 1 does not appear "
+			~ "verbatim in the passage. Respond again with the same JSON "
+			~ "contract, corrected.",
+		'... quoting the VALIDATOR\'s diagnostic verbatim';
+
+	nok LLM::Data::Inference::JSONTask.new(
+		backend     => mock(),
+		user-prompt => 'q',
+	).retry-feedback, 'JSONTask defaults the flag to False too';
+};
+
+done-testing;

@@ -2,6 +2,77 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.7.0  2026-07-27T15:25:50+01:00
+    - [2026-07-25] Cancellation and deadline aborts now route through
+      C<Backend.cancel> instead of C<Response.cancel>. Closing the
+      Response only quits the local supplier; the upstream stop signal
+      lives in the backend override, so against KoboldCpp a cancelled
+      Task now fires C<POST /api/extra/abort> and the server actually
+      stops generating. Previously every Task-mediated job (reconcile,
+      narrative-state, downstream-projection, image prompt-gen,
+      scene-shakeup, relationship-mode in App::Cantina) looked
+      cancelled to the caller while the backend drained the full
+      completion. Backends with no upstream abort endpoint degrade to
+      exactly the previous local close, and a backend whose C<cancel>
+      throws falls back to the local close so the poll loop can never
+      spin on a live response. Both the C<is-cancelled> branch and the
+      C<$.timeout> branch are covered.
+    - [2026-07-27] Typed truncation. A blocking completion cut off by
+      C<max_tokens> comes back as an HTTP 200 SUCCESS with a partial
+      body and C<finish_reason> 'length' — the "advance on
+      finish-reason quit" rule in the docs was only ever true of the
+      STREAMING path. Task therefore handed half-finished output to
+      the parser, watched it fail, and (with C<:parse-retries> set)
+      re-rolled the identical over-budget request until the budget
+      was gone. Task and JSONTask now take
+      C<:truncation-policy('fail' | 'accept' | '')>: 'fail' records
+      the truncation and advances to the next backend at once WITHOUT
+      consuming a parse re-roll (C<max_tokens> is per-backend
+      C<Settings>, so only a different backend can change it);
+      'accept' is the historical behaviour; the default C<''> derives
+      'fail' when a parser is installed and 'accept' when one is not,
+      so JSON tasks fail fast while prose tasks (continuations, style
+      passes) keep their partial output bit-for-bit as before. The
+      check runs BEFORE the empty-body rule, so a reasoning model that
+      burns its whole budget inside C<< <think> >> is diagnosed as
+      truncation rather than "empty response body". A chain that
+      truncates throws the new
+      C<X::LLM::Data::Inference::Truncated> — a SUBCLASS of
+      C<Exhausted>, so DLQ routing, C<:on-exhausted> hooks and every
+      existing C<when Exhausted> handler keep working unchanged — and
+      its summary names the levers (raise C<max_tokens>, add a
+      larger-budget fallback, or shrink the request). Failed responses
+      also keep any text they emitted before quitting, so partial
+      streamed output is capturable instead of dropped. Requires
+      LLM::Chat 0.7.1 for the Mock C<finish-reason-producer> knob the
+      tests drive this with.
+    - [2026-07-27] Add C<:retry-feedback> to Task and JSONTask (default
+      False). A parse re-roll used to be blind — identical prompt,
+      identical model, no word about what was wrong with the answer
+      just rejected. That is survivable for malformed JSON on a
+      stochastic sampler, but hopeless for a SEMANTIC rejection: a
+      verbatim-quote validator that says "quote 2 does not appear in
+      the passage" says exactly the same thing on every re-roll, so
+      the item burned its whole budget failing identically and then
+      dead-lettered something the model could have fixed on the second
+      try. With the flag set, an attempt that follows a parser or
+      validator failure on the SAME backend carries one extra C<user>
+      turn: "Your previous response was rejected: <the parser's
+      message>. Respond again with the same JSON contract,
+      corrected." Each re-roll REPLACES the previous feedback instead
+      of accumulating a transcript of complaints (the message list is
+      re-derived from the pristine prompt every attempt), and the
+      pending reason lives per backend, so truncation advances,
+      backend advances and network retry-sames all send the prompt
+      they always did — a model is only ever told about output it
+      actually produced. The rejected text itself is deliberately not
+      echoed back (it is already the model's own last turn, and this
+      ecosystem's validator diagnostics are the part it cannot infer);
+      the canned wording names a JSON contract, which is why prose
+      Tasks are expected to leave the flag alone. Telemetry is
+      unchanged — the extra turn shows up only as a larger
+      C<prompt-tokens> figure (~100 tokens) on the retry row.
+
 0.5.1  2026-07-21T03:15:12+01:00
     - [2026-07-19] Add C<:on-exhausted> to Task: an optional hook that
       fires exactly once, on the execute thread, immediately before

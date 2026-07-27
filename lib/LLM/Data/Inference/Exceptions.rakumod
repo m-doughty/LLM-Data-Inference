@@ -15,6 +15,20 @@ per-attempt failure records, including the B<raw model output> for
 parser failures, so callers can show the user exactly what the model
 produced instead of only "parser: unexpected ']'".
 
+C<X::LLM::Data::Inference::Truncated> is a B<subclass> of
+C<Exhausted>, thrown in its place when at least one attempt in the
+exhausted chain died because the model ran out of completion budget
+(the provider reported C<finish_reason> C<'length'>) rather than
+because it produced something unusable. Being a subclass is the whole
+point: every existing C<Exhausted> handler — DLQ routing, CLI error
+reporting, C<:on-exhausted> hooks — keeps catching it unchanged, while
+callers that care can add a narrower arm to say "this one is fixable:
+raise the budget" instead of "the model can't do this". It carries no
+extra attributes; the lever is named in the C<summary>, and the
+truncated attempt records carry their partial output as C<raw-text>.
+Only a Task with C<truncation-policy> C<'fail'> can throw it — see
+L<LLM::Data::Inference::Task>.
+
 C<X::LLM::Data::Inference::Cancelled> is thrown by the same Task when
 its C<is-cancelled> hook reports that the caller no longer wants the
 result — before a round-trip, between retries, or mid-call (the
@@ -41,6 +55,13 @@ my $result = do {
             # The caller asked for this — clean up quietly.
             %();
         }
+        # Truncated IS an Exhausted, so it must come FIRST — a `when`
+        # chain takes the first matching arm, and the Exhausted arm
+        # below would otherwise swallow it.
+        when X::LLM::Data::Inference::Truncated {
+            note "every attempt hit the token budget:\n{.message}";
+            %();
+        }
         when X::LLM::Data::Inference::Exhausted {
             for .attempts.grep(*.<raw-text>.defined) -> %a {
                 note "model %a<model> said:\n%a<raw-text>";
@@ -52,6 +73,10 @@ my $result = do {
 };
 
 =end code
+
+Callers that do not care about the distinction need no change at all:
+a bare C<when X::LLM::Data::Inference::Exhausted> still catches a
+C<Truncated>, and C<:on-exhausted> fires identically for both.
 
 =end pod
 
@@ -74,6 +99,25 @@ class X::LLM::Data::Inference::Exhausted is Exception is export {
 
 	method message(--> Str) { $!summary }
 }
+
+#|( Thrown INSTEAD of C<Exhausted> when at least one attempt in the
+    exhausted chain was cut off by the completion budget — the
+    provider reported C<finish_reason> 'length' and the Task's
+    C<truncation-policy> is 'fail'. Same shape as C<Exhausted> (no
+    extra attributes): the truncation is described in C<summary>,
+    which also names the levers (raise C<max_tokens>, add a
+    larger-budget fallback backend, or shrink the request), and each
+    truncated attempt record keeps whatever partial output arrived as
+    C<raw-text>.
+
+    Deliberately a SUBCLASS of C<Exhausted>, unlike C<Cancelled>:
+    truncation IS a chain failure and belongs in the dead-letter
+    queue, so every existing handler must keep working untouched.
+    The subclass only exists so callers who want to distinguish
+    "fixable by raising the budget" from "the model produced
+    garbage" can, by matching it BEFORE the C<Exhausted> arm. )
+class X::LLM::Data::Inference::Truncated
+	is X::LLM::Data::Inference::Exhausted is export { }
 
 #|( Thrown when the Task's C<is-cancelled> hook reports the caller
     withdrew mid-execute. C<attempts> matches C<Exhausted>'s shape

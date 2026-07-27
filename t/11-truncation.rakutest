@@ -1,0 +1,295 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# Truncation policy: a blocking completion cut off by max_tokens comes
+# back as an HTTP 200 SUCCESS carrying a partial body and
+# finish_reason 'length'. Left alone the Task feeds that half-finished
+# text to the parser, watches it fail, and re-rolls the identical
+# over-budget request until parse-retries are gone — every one of
+# those re-rolls is guaranteed to truncate again at the same budget.
+#
+# The policy intercepts it: 'fail' advances to the next backend at
+# once (which may carry a bigger max_tokens) without touching the
+# parse-retry budget, and a chain that truncates all the way through
+# throws X::LLM::Data::Inference::Truncated — an Exhausted SUBCLASS,
+# so DLQ routing and existing handlers keep working untouched.
+
+plan 9;
+
+sub mock-truncated(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+		finish-reason-producer => -> $i { 'length' },
+	);
+}
+
+sub mock-ok(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{') && $text.ends-with('}');
+	$text;
+};
+
+subtest 'truncation fails fast without burning parse-retries' => {
+	plan 5;
+	# The pathology this exists to kill: parse-retries would otherwise
+	# re-roll the same doomed request twice more.
+	my $backend = mock-truncated('{"beats": [{"first": 0,');
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => $backend,
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Data::Inference::Exhausted { $caught = $_ } }
+	}
+	ok $caught.defined, 'the chain throws';
+	is $backend.call-index, 1,
+		'exactly ONE round-trip — the parse-retry budget is untouched';
+	is $caught.attempts.elems, 1, 'one attempt recorded';
+	like $caught.attempts[0]<error>, /'truncated:'/,
+		'the attempt is recorded as a truncation';
+	is $caught.attempts[0]<raw-text>, '{"beats": [{"first": 0,',
+		'the partial output is preserved for inspection';
+};
+
+subtest 'Truncated is an Exhausted subclass, and not a Cancelled' => {
+	plan 5;
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => mock-truncated('{"partial"'),
+		user-prompt => 'q',
+		parser      => &json-parser,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'the specific type is thrown';
+	isa-ok $caught, X::LLM::Data::Inference::Exhausted,
+		'... and it IS an Exhausted';
+	nok $caught ~~ X::LLM::Data::Inference::Cancelled,
+		'... but never a Cancelled — the caller did not withdraw';
+
+	# An untouched legacy handler must still catch it.
+	my $legacy-caught = False;
+	{
+		LLM::Data::Inference::Task.new(
+			backend     => mock-truncated('{"partial"'),
+			user-prompt => 'q',
+			parser      => &json-parser,
+		).execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $legacy-caught = True }
+		}
+	}
+	ok $legacy-caught,
+		'a bare `when Exhausted` handler catches it unchanged';
+
+	like $caught.message, /'max_tokens'/,
+		'the message names the budget that was hit';
+};
+
+subtest 'a truncating backend advances to one that fits' => {
+	plan 4;
+	my $small = mock-truncated('{"beats": [{"first"');
+	my $big   = mock-ok('{"beats": []}');
+	my $task = LLM::Data::Inference::Task.new(
+		backends      => [$small, $big],
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+	);
+	is $task.execute, '{"beats": []}',
+		'the larger-budget backend produces the result';
+	is $small.call-index, 1,
+		'the truncating backend was tried exactly once';
+	is $big.call-index, 1,
+		'the fallback was reached on the very next call';
+	# max_tokens is per-backend Settings state, so advancing is the only
+	# move that can change the budget. The contrast makes the saving
+	# concrete: under 'accept' the same chain feeds the truncated body
+	# to the parser and spends the whole attempt budget on the backend
+	# that cannot possibly succeed before it ever advances.
+	my $small2 = mock-truncated('{"beats": [{"first"');
+	my $big2   = mock-ok('{"beats": []}');
+	LLM::Data::Inference::Task.new(
+		backends          => [$small2, $big2],
+		user-prompt       => 'q',
+		parser            => &json-parser,
+		parse-retries     => 2,
+		truncation-policy => 'accept',
+	).execute;
+	is $small2.call-index, 3,
+		'... where accept burns all three attempts on the doomed backend';
+};
+
+subtest 'parser-less Task keeps the partial text (derived accept)' => {
+	plan 3;
+	# Prose tasks — continuations, style passes — frequently want the
+	# truncated output. The derived default must be bit-for-bit the
+	# historical behaviour for them.
+	my $backend = mock-truncated('The storm reaches the harbour and');
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => $backend,
+		user-prompt => 'q',
+	);
+	is $task.execute, 'The storm reaches the harbour and',
+		'truncated prose is returned, not thrown';
+	is $backend.call-index, 1, 'one call, no retries';
+	is $task.truncation-policy, '',
+		'the attribute itself is still the derive sentinel';
+};
+
+subtest 'parser-less Task can opt INTO failing on truncation' => {
+	plan 3;
+	my $backend = mock-truncated('half a sentence');
+	my $task = LLM::Data::Inference::Task.new(
+		backend           => $backend,
+		user-prompt       => 'q',
+		truncation-policy => 'fail',
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'explicit fail overrides the derived accept';
+	is $caught.attempts[0]<raw-text>, 'half a sentence',
+		'the partial prose is still captured on the record';
+	is $backend.call-index, 1, 'one call';
+};
+
+subtest 'parser Task can opt INTO accepting truncated output' => {
+	plan 3;
+	# Explicit 'accept' means the partial body reaches the parser. Here
+	# it happens to parse — a model that finished its JSON just as the
+	# budget ran out — and the value comes straight back.
+	my $backend = mock-truncated('{"beats": []}');
+	my $task = LLM::Data::Inference::Task.new(
+		backend           => $backend,
+		user-prompt       => 'q',
+		parser            => &json-parser,
+		truncation-policy => 'accept',
+		parse-retries     => 2,
+	);
+	is $task.execute, '{"beats": []}',
+		'explicit accept overrides the derived fail';
+	is $backend.call-index, 1, 'one call';
+	is $task.truncation-policy, 'accept', 'the attribute reads back';
+};
+
+subtest 'think-budget burnout reports as truncation, not empty body' => {
+	plan 3;
+	# A reasoning model that spends its entire budget inside
+	# <think>...</think> returns 200 with an EMPTY body and reason
+	# 'length'. Order matters: the empty-body rule would otherwise
+	# claim it and point the reader at the wrong bug.
+	my $backend = mock-truncated('');
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => $backend,
+		user-prompt => 'q',
+		parser      => &json-parser,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'an empty truncated body is still a truncation';
+	like $caught.attempts[0]<error>, /'truncated:'/,
+		'diagnosed as truncated';
+	nok $caught.attempts[0]<error>.contains('empty response body'),
+		'NOT diagnosed as an empty response body';
+};
+
+subtest 'on-exhausted fires with the lever line and identical attempts' => {
+	plan 6;
+	my @hook-calls;
+	my $b1 = mock-truncated('{"a"');
+	my $b2 = mock-ok('not json at all');
+	my $task = LLM::Data::Inference::Task.new(
+		backends     => [$b1, $b2],
+		user-prompt  => 'q',
+		parser       => &json-parser,
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Data::Inference::Exhausted { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'one truncation anywhere in the chain types the whole failure';
+	is @hook-calls.elems, 1, 'the DLQ hook still fires exactly once';
+	my %info = @hook-calls[0];
+	is %info<summary>, $caught.summary,
+		'hook summary is the exception summary';
+	like %info<summary>, /'raise that backend' \N* 'max_tokens'/,
+		'the summary names the lever';
+	my Bool $same-objects = so (0 ..^ %info<attempts>.elems).map({
+		%info<attempts>[$_] === $caught.attempts[$_]
+	}).all;
+	ok $same-objects,
+		'the DLQ payload carries the identical attempt records';
+	is %info<attempts>.elems, 2,
+		'both the truncation and the parse failure are recorded';
+};
+
+subtest 'JSONTask defaults to fail and honours an explicit accept' => {
+	plan 6;
+	# JSONTask always installs a parser, so the derived policy is
+	# 'fail' — zero caller changes needed to get the fast path.
+	my $b1 = mock-truncated('{"name": "Mira", "age":');
+	my $strict = LLM::Data::Inference::JSONTask.new(
+		backend       => $b1,
+		user-prompt   => 'q',
+		required-keys => <name age>,
+		parse-retries => 3,
+	);
+	my $caught;
+	{
+		$strict.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'a truncated JSON body throws Truncated by default';
+	is $b1.call-index, 1,
+		'three parse-retries were available and none were spent';
+	like $caught.message, /'max_tokens'/, 'the lever is in the message';
+
+	# 'accept' hands the partial text to the JSON parser, which fails
+	# on its own terms — and THEN parse-retries apply as normal.
+	my $b2 = mock-truncated('{"name": "Mira", "age":', '{"name": "Mira", "age": 30}');
+	my $lenient = LLM::Data::Inference::JSONTask.new(
+		backend           => $b2,
+		user-prompt       => 'q',
+		required-keys     => <name age>,
+		parse-retries     => 1,
+		truncation-policy => 'accept',
+	);
+	my %parsed = $lenient.execute;
+	is %parsed<name>, 'Mira', 'the re-roll produced a complete object';
+	is %parsed<age>, 30, 'and its second key';
+	is $b2.call-index, 2,
+		'accept lets the parse-retry budget do its historical job';
+};
+
+done-testing;

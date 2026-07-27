@@ -35,13 +35,30 @@ Thin composition over L<LLM::Data::Inference::Task> that plugs in a
 JSON parser + key-presence + custom-validator pipeline. All fallback
 and retry semantics come from the underlying Task — see its Pod for
 the full bucket classification. C<:parse-retries> threads through for
-same-backend re-rolls on malformed output; C<:is-cancelled> threads
+same-backend re-rolls on malformed output; C<:truncation-policy>
+threads through too and, left at its default, resolves to C<'fail'>
+here — a JSON task always has a parser, and a completion cut off by
+C<max_tokens> can never parse, so the chain advances at once and
+throws C<X::LLM::Data::Inference::Truncated> (an C<Exhausted>
+subclass) if every backend truncates; C<:is-cancelled> threads
 through for cooperative cancellation (the Task throws
 C<X::LLM::Data::Inference::Cancelled> and aborts any in-flight
 response as soon as the hook reports True); C<:on-exhausted> threads
 through unchanged and fires exactly once, immediately before the
 chain throws C<X::LLM::Data::Inference::Exhausted> — see Task's Pod
 for the full payload shape.
+
+C<:retry-feedback> threads through as well, and this is the class it
+was built for: it makes those C<:parse-retries> re-rolls B<informed>,
+appending one extra C<user> turn that quotes the rejection — a JSON
+syntax error, a missing C<@.required-keys> entry, or whatever message
+C<&.validator> died with. A semantic rejection ("quote 2 does not
+appear verbatim in the passage") is otherwise re-produced verbatim on
+every blind re-roll, so the item burns its whole budget failing
+identically; with feedback the second attempt is a correction pass.
+Each re-roll replaces the previous feedback, and only re-rolls against
+the same backend are informed — see Task's "Retry feedback" Pod
+section for the full rules.
 
 Accepts either C<:$backend> (single) or C<:@backends> (chain); both
 forms thread through to the inner Task unchanged.
@@ -75,6 +92,29 @@ has Int:D $.max-retries = 3;
 #| Same-backend re-roll budget for parse/validation failures —
 #| threaded through to the inner Task (see its Pod for the trade-off).
 has UInt:D $.parse-retries = 0;
+
+#|( Give parse re-rolls the rejection reason, threaded through to the
+    inner Task — see its "Retry feedback" Pod section. A JSON task is
+    exactly the case the flag was built for: the failures it produces
+    (JSON syntax, C<@.required-keys> misses, C<&.validator> verdicts)
+    all come with a message that names what to fix, so an informed
+    re-roll can converge where a blind one repeats itself. Each re-roll
+    replaces the previous feedback; only re-rolls against the SAME
+    backend are informed. Costs roughly a hundred extra prompt tokens
+    on those attempts and nothing at all on the first. )
+has Bool:D $.retry-feedback = False;
+
+#|( Truncation policy, threaded through to the inner Task — see its
+    "Truncated output" Pod section. Left at the default C<''> the
+    inner Task derives C<'fail'>, because a JSONTask ALWAYS installs a
+    parser: a completion cut off by C<max_tokens> is unparseable JSON
+    by construction, so it advances to the next backend immediately
+    instead of burning C<parse-retries> re-rolling the same
+    over-budget request. Pass C<'accept'> to get the historical
+    behaviour (hand the partial text to the parser and let it fail
+    on its own terms). )
+has Str:D $.truncation-policy where { $_ eq any('', 'fail', 'accept') } = '';
+
 has Num:D $.timeout = 120e0;
 has Str @.required-keys;
 has &.validator;
@@ -133,6 +173,8 @@ method execute(--> Any) {
 		:$!user-prompt,
 		:$!max-retries,
 		:$!parse-retries,
+		:$!retry-feedback,
+		:$!truncation-policy,
 		:$!timeout,
 		:parser(&json-parser),
 		:on-call-complete(&!on-call-complete),

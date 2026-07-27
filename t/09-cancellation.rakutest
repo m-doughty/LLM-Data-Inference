@@ -4,6 +4,7 @@ use LLM::Data::Inference::Task;
 use LLM::Data::Inference::JSONTask;
 use LLM::Data::Inference::Exceptions;
 use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Settings;
 
 # Cooperative cancellation: the is-cancelled hook must stop the Task
@@ -12,10 +13,32 @@ use LLM::Chat::Backend::Settings;
 # response) — throwing the typed Cancelled exception rather than
 # burning the retry chain.
 
-plan 6;
+plan 8;
 
 sub mock-seq(*@responses, *%extra) {
 	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+		|%extra,
+	);
+}
+
+# Aborting must route through Backend.cancel, never Response.cancel:
+# only the backend override carries the upstream stop signal (against
+# KoboldCpp, POST /api/extra/abort). Closing the Response locally looks
+# identical from the caller's side — same exception, same timing —
+# while the server happily generates the whole completion into a socket
+# nobody is reading. So assert on the routing itself, not the symptom.
+class CancelSpy is LLM::Chat::Backend::Mock {
+	has Int $.backend-cancels = 0;
+	method cancel(LLM::Chat::Backend::Response $resp) {
+		$!backend-cancels++;
+		nextsame;
+	}
+}
+
+sub spy-seq(*@responses, *%extra) {
+	CancelSpy.new(
 		settings  => LLM::Chat::Backend::Settings.new,
 		responses => @responses,
 		|%extra,
@@ -109,6 +132,44 @@ subtest 'cancel mid-call aborts the in-flight response' => {
 	ok now - $t0 < 1.0,
 		'returned well before the 2 s response latency — call was aborted';
 	is $backend.call-index, 1, 'the one in-flight call is all there was';
+};
+
+subtest 'mid-call cancel aborts via Backend.cancel, not Response.cancel' => {
+	plan 3;
+	my $backend = spy-seq('slow answer', initial-delay => 2.0);
+	my Int $checks = 0;
+	my $task = LLM::Data::Inference::Task.new(
+		backend      => $backend,
+		user-prompt  => 'q',
+		is-cancelled => -> { ++$checks >= 2 },
+	);
+	my $t0 = now;
+	throws-like { $task.execute },
+		X::LLM::Data::Inference::Cancelled,
+		'mid-flight cancel still throws the typed exception';
+	is $backend.backend-cancels, 1,
+		'abort routed through Backend.cancel — upstream stop signal fires';
+	ok now - $t0 < 1.0,
+		'still returned well before the 2 s latency — local close intact';
+};
+
+subtest 'deadline abort also routes through Backend.cancel' => {
+	plan 2;
+	# The timeout branch is the cancel branch's twin; a fix applied to
+	# one and not the other leaves half the aborts silent upstream.
+	my $backend = spy-seq('too slow', initial-delay => 3.0);
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => $backend,
+		user-prompt => 'q',
+		timeout     => 0.2e0,
+		max-retries => 1,
+	);
+	my $t0 = now;
+	try $task.execute;
+	is $backend.backend-cancels, 1,
+		'deadline abort carries the upstream stop signal too';
+	ok now - $t0 < 2.0,
+		'returned on the 0.2 s deadline, not the 3 s response latency';
 };
 
 subtest 'cancel interrupts retry backoff' => {

@@ -56,6 +56,15 @@ failure. These are model-specific: the current model ran into a
 pathology (reasoning loop, sanitisation, malformed JSON). Skip to
 the next backend.
 
+The "finish-reason quit" case above is B<streaming-only>. A streamed
+C<'length'> / C<'content_filter'> makes the backend quit the supply
+with error class C<'response'>, which lands in this bucket. The
+B<blocking> C<chat-completion> path the Task actually uses does not
+fail on either: a completion cut off by C<max_tokens> comes back as an
+ordinary HTTP 200 success carrying a partial body, with the reason
+only visible as C<$response.finish-reason>. See L</Truncated output>
+for how that is intercepted.
+
 =head2 Per-backend attempt budget
 
 Each backend gets up to C<$.max-retries> HTTP round-trips (default 3):
@@ -85,6 +94,143 @@ the advance rule kicks in. The raw model output of every failed parse
 is preserved on the thrown C<X::LLM::Data::Inference::Exhausted>
 (see L<LLM::Data::Inference::Exceptions>), so callers can surface
 I<what the model actually said> instead of only the parse error.
+
+=head2 Retry feedback
+
+A parse re-roll is B<blind> by default: the same prompt goes back to
+the same model, and nothing tells it what was wrong with the answer it
+just gave. That is fine for malformed JSON on a stochastic sampler — a
+fresh roll usually closes its brackets — but useless for a I<semantic>
+rejection. A validator that says "quote 2 does not appear verbatim in
+the passage" will keep saying it, three times, and the Task will
+dead-letter an item the model could have fixed on the second try.
+
+C<:retry-feedback> (opt-in, default C<False>) makes the re-roll
+informed: after a parser or validator failure, the next attempt against
+B<the same backend> carries one extra C<user> turn naming the rejection.
+
+=begin code :lang<raku>
+
+my $task = LLM::Data::Inference::JSONTask.new(
+    :backends($primary, $fallback),
+    :$user-prompt,
+    :validator(&quotes-appear-verbatim),
+    :parse-retries(2),
+    :retry-feedback,       # re-rolls now say WHY the last one lost
+);
+
+=end code
+
+The appended turn reads:
+
+=begin code :lang<text>
+
+Your previous response was rejected: <the parser's message>. Respond
+again with the same JSON contract, corrected.
+
+=end code
+
+Three properties are worth being explicit about, because each one is a
+decision rather than an accident:
+
+=item B<Replace, never accumulate.> Each attempt derives its message
+list from the pristine C<@messages>, so re-roll 2 carries re-roll 2's
+rejection and B<not> re-roll 1's. The alternative — appending to a
+growing transcript — would spend an ever-larger prompt on
+progressively staler complaints, and models reliably fixate on the
+first item in such a list.
+
+=item B<Parse failures only.> The feedback slot is filled in the
+parser-failure branch and nowhere else. A truncation is a budget fact,
+not a mistake the model can correct by trying harder (see
+L</Truncated output>); a network retry-same never produced output to
+critique; and the slot lives B<per backend>, so a backend advance
+starts the next model on the pristine prompt — its predecessor's
+mistakes are not evidence about anything it did. (The slot is sticky
+until the backend changes: if a parse failure is followed by a
+transient network error, the retry after that error still carries the
+pending feedback, because the rejection it describes is still the last
+thing the model actually said.)
+
+=item B<No echo of the rejected output.> The feedback names the error,
+not the text that produced it. The model has its own last turn in
+context on every provider worth using, so echoing it back doubles the
+prompt to restate what the model already knows; and validator
+diagnostics in this ecosystem are written to identify the failing item
+precisely ("beat 3, quote 2: ..."), which is the part the model cannot
+infer. If a caller wants the raw text in the loop, it is on every
+attempt record already — write a parser that folds it into its own
+message.
+
+The canned wording names a B<JSON contract>, which makes it correct for
+C<JSONTask> and for hand-rolled JSON parsers, and wrong for prose
+Tasks. That is deliberate: prose Tasks simply do not opt in. (Callers
+who want feedback with different wording can raise it from inside the
+parser instead, since the parser's message is what gets quoted.)
+
+Telemetry is unchanged — C<&on-call-complete> carries no message-count
+field, so the extra turn shows up only as a larger C<prompt-tokens>
+figure on the retry row. Budget roughly a hundred extra prompt tokens
+per informed re-roll.
+
+=head2 Truncated output
+
+A blocking completion that runs out of completion budget is not an
+error at the transport level: HTTP 200, a well-formed body, a partial
+answer, and C<finish_reason> C<'length'>. Left alone, the Task would
+hand that half-finished text to C<&.parser>, watch it fail, and — with
+C<:parse-retries> set — re-roll the I<identical doomed request> until
+the budget was spent, because a request that overran once will overrun
+again at the same C<max_tokens>.
+
+C<$.truncation-policy> decides what happens instead:
+
+=item C<'fail'> — a C<'length'> finish reason is recorded as a failure
+and the Task advances to the next backend B<immediately>, without
+consuming a parse re-roll. C<max_tokens> is per-backend
+C<Settings> state, so the next backend in the chain can legitimately
+have a bigger budget and succeed where this one could not — but a
+same-backend re-roll cannot. If the whole chain truncates, the Task
+throws C<X::LLM::Data::Inference::Truncated> (a subclass of
+C<Exhausted>, so existing handlers are unaffected) and the summary
+names the levers.
+
+=item C<'accept'> — historical behaviour. The partial text is the
+result: returned as-is when there is no parser, handed to the parser
+when there is.
+
+=item C<''> (the default) — B<derive> the policy: C<'fail'> when
+C<&.parser> is set, C<'accept'> when it is not. A truncated payload
+headed for a parser can never parse, so failing fast only removes a
+guaranteed-waste path; truncated prose, on the other hand, is
+frequently still the product (continuations, style passes), so
+parser-less Tasks keep their historical behaviour bit-for-bit. Set the
+attribute explicitly to override in either direction.
+
+C<LLM::Data::Inference::JSONTask> always installs a parser, so it
+defaults to C<'fail'>.
+
+The empty-body rule is checked B<after> truncation, deliberately: a
+reasoning model that spends its entire budget inside
+C<< <think>…</think> >> returns 200 with an empty body and
+C<finish_reason> C<'length'>. That is budget exhaustion, and reporting
+it as "empty response body" sends the reader hunting the wrong bug.
+
+=begin code :lang<raku>
+
+# Prose task that wants the partial text anyway (the default already
+# does this, since no parser is set — spelled out for clarity).
+my $prose = LLM::Data::Inference::Task.new(
+    :$backend, :$user-prompt, truncation-policy => 'accept',
+);
+
+# JSON task on a chain whose second backend has a bigger budget.
+my $json = LLM::Data::Inference::JSONTask.new(
+    backends => [$small-budget, $big-budget], :$user-prompt,
+    parse-retries => 2,   # never burned on a truncation
+);
+
+=end code
 
 =head2 Telemetry
 
@@ -124,8 +270,14 @@ my $task = LLM::Data::Inference::Task.new(
 
 C<:&is-cancelled> is polled at every decision point: before each
 round-trip, inside the in-flight completion poll (the pending response
-is aborted via C<Response.cancel>, exactly like the timeout path),
+is aborted via C<Backend.cancel>, exactly like the timeout path),
 between backoff sleeps, and before parse re-rolls / backend advances.
+
+Aborting through C<Backend.cancel> rather than C<Response.cancel> is
+what makes the cancel reach the server: against KoboldCpp it fires
+C<POST /api/extra/abort> alongside the local stream close, so a
+cancelled Task stops the generation instead of only looking away from
+it. Backends with no upstream abort endpoint degrade to a local close.
 When it returns True the Task throws
 C<X::LLM::Data::Inference::Cancelled> (see
 L<LLM::Data::Inference::Exceptions>) carrying whatever attempt records
@@ -186,6 +338,41 @@ has &.parser;
     deterministic-ish sampling should leave it at 0 (identical
     malformed output re-rolled is wasted spend; see the module Pod). )
 has UInt:D $.parse-retries = 0;
+
+#|( Tell the model B<why> a parse re-roll is happening. When True, an
+    attempt that follows a parser/validator failure on the SAME backend
+    carries one extra C<user> turn quoting the rejection reason, which
+    turns a blind re-roll into a correction pass (the difference between
+    "3 identical failures" and "fixed on attempt 2" for semantic
+    validators). Only meaningful together with C<$.parse-retries> — with
+    a zero re-roll budget there is no second attempt to inform.
+
+    Each re-roll REPLACES the previous feedback rather than accumulating
+    a transcript of complaints, and the slot is per-backend, so
+    truncation advances, network retry-sames and backend advances never
+    inherit it. Default False: the canned wording names a JSON contract,
+    so prose Tasks must not get it by accident. See the "Retry feedback"
+    section of the module Pod. )
+has Bool:D $.retry-feedback = False;
+
+#|( What to do when a completion comes back cut off by the token
+    budget (HTTP 200, partial body, C<finish_reason> 'length'):
+
+      * 'fail'   — record the truncation and advance to the next
+                   backend at once, without consuming a parse
+                   re-roll; throw C<Truncated> if the chain exhausts.
+      * 'accept' — historical behaviour: treat the partial text as
+                   the result (parse it, or return it raw).
+      * ''       — derive it (the default): 'fail' when C<&.parser>
+                   is set, 'accept' when it is not.
+
+    The derived default is the whole point of the empty-string
+    sentinel: truncated JSON can never parse, so re-rolling the same
+    over-budget request is guaranteed waste, while truncated prose is
+    often still usable and must keep behaving exactly as it always
+    has. See the "Truncated output" section of the module Pod. )
+has Str:D $.truncation-policy where { $_ eq any('', 'fail', 'accept') } = '';
+
 has Num:D $.timeout = 120e0;
 
 #|( Optional telemetry hook. Fires once per HTTP round-trip,
@@ -273,6 +460,24 @@ method classify-error(
 	}
 }
 
+#|( The one extra C<user> turn a C<:retry-feedback> re-roll carries.
+
+    Names the rejection and re-states the contract, and deliberately
+    does NOT echo the rejected output: the model's own last turn is
+    already in context, so quoting it back doubles the prompt to tell
+    the model something it knows, while the parser's message is the
+    part it cannot infer (this ecosystem's validators name the failing
+    item precisely — "beat 3, quote 2: ...").
+
+    "the same JSON contract" is why C<$.retry-feedback> defaults to
+    False: it is right for JSON parsers and wrong for prose, and prose
+    Tasks therefore never opt in. Pure function, no state — the
+    per-backend feedback slot lives in C<execute>. )
+my sub feedback-message(Str:D $error --> Str:D) {
+	"Your previous response was rejected: $error. "
+		~ "Respond again with the same JSON contract, corrected.";
+}
+
 method execute(--> Any) {
 	my @messages;
 	if $!system-prompt.defined {
@@ -287,6 +492,11 @@ method execute(--> Any) {
 	my Int:D $attempt = 0;
 	my @errors;
 	my @attempt-records;
+	my Str:D $truncation-policy = self!effective-truncation-policy;
+	# Sticky across the whole chain: one truncated attempt anywhere is
+	# enough to make the exhaustion Truncated-typed and to earn the
+	# summary its "raise the budget" line.
+	my Bool $saw-truncation = False;
 	sub record-failure(Int $backend-index, Str $model, Str $error, Str :$raw-text) {
 		@errors.push: $error;
 		my %rec = backend-index => $backend-index, model => $model,
@@ -307,6 +517,12 @@ method execute(--> Any) {
 		my $same-retries-left = $!max-retries > 0 ?? $!max-retries - 1 !! 0;
 		my $parse-retries-left = $!parse-retries;
 		my $model-name = (try { $backend.model }) // 'unknown';
+		# Pending retry feedback for THIS backend: the rejection reason
+		# from its last parse failure, or undefined when the next call is
+		# a first impression. Declared inside the backend loop so a
+		# backend advance resets it for free — the next model must not
+		# inherit its predecessor's mistakes.
+		my Str $feedback;
 
 		loop {
 			# One check point covers the initial call, post-backoff
@@ -314,7 +530,19 @@ method execute(--> Any) {
 			# path re-enters the loop top before touching the network.
 			throw-cancelled if cancelled-now;
 			$attempt++;
-			my %call = self!call-blocking(@messages, $backend);
+			# Derived from the PRISTINE @messages every single iteration:
+			# that is precisely what makes each re-roll REPLACE the
+			# previous feedback instead of stacking a transcript of
+			# rejections. @messages itself is never mutated.
+			my @call-messages = ($!retry-feedback && $feedback.defined)
+				?? (
+					|@messages,
+					LLM::Chat::Conversation::Message.new(
+						role => 'user', content => feedback-message($feedback),
+					),
+				)
+				!! @messages;
+			my %call = self!call-blocking(@call-messages, $backend);
 			self!fire-telemetry(
 				%call,
 				:$attempt,
@@ -377,6 +605,36 @@ method execute(--> Any) {
 
 			# HTTP succeeded — inspect the body.
 			my Str $text = %call<text>;
+
+			# Budget exhaustion, which the blocking path reports as a
+			# SUCCESS: 200, a well-formed body, and finish_reason
+			# 'length'. Checked before the empty-body rule on purpose —
+			# a reasoning model that spends its whole budget thinking
+			# returns an empty body with reason 'length', and calling
+			# that "empty response body" points the reader at the wrong
+			# bug.
+			my Str $finish = ((%call<response>.defined
+				?? %call<response>.finish-reason
+				!! Str) // '');
+			if $finish eq 'length' && $truncation-policy eq 'fail' {
+				$saw-truncation = True;
+				# Keep whatever partial output arrived so the caller
+				# can see how far the model got; an empty body has
+				# nothing worth recording.
+				my Str $partial = ($text.defined && $text.chars)
+					?? $text !! Str;
+				record-failure($i, $model-name,
+					"[backend $i $model-name] truncated: output was cut "
+					~ "off by the max_tokens completion budget "
+					~ "(finish_reason 'length')",
+					raw-text => $partial);
+				# Advance WITHOUT touching $parse-retries-left: the
+				# same backend re-rolling the same over-budget request
+				# will overrun again at the same max_tokens, while the
+				# next backend may carry a bigger budget.
+				last;
+			}
+
 			unless $text.defined && $text.chars {
 				record-failure($i, $model-name,
 					"[backend $i $model-name] empty response body");
@@ -403,6 +661,12 @@ method execute(--> Any) {
 			record-failure($i, $model-name,
 				"[backend $i $model-name] parser: $parse-error",
 				raw-text => $text);
+			# The ONE place feedback is produced. Overwrites whatever was
+			# pending, so the next re-roll argues about the newest
+			# rejection only. Set unconditionally (not just when a re-roll
+			# is left) — a spent budget takes `last` below and the slot
+			# dies with the backend either way.
+			$feedback = $parse-error if $!retry-feedback;
 			if $parse-retries-left > 0 {
 				# Stochastic samplers usually produce parseable
 				# output on a fresh roll; no backoff — the backend
@@ -414,14 +678,59 @@ method execute(--> Any) {
 		}
 	}
 
+	# The lever line only appears when a truncation was actually
+	# recorded, so summaries of ordinary failures are byte-identical
+	# to what they always were.
+	my Str:D $lever = $saw-truncation
+		?? "\n  At least one attempt was cut off by the completion "
+			~ "budget: raise that backend's max_tokens completion "
+			~ "budget, add a fallback backend with a larger one, or "
+			~ "shrink the request."
+		!! '';
 	my Str:D $summary =
 		"LLM::Data::Inference::Task: all {@!backends.elems} backend(s) exhausted.\n"
-		~ @errors.map({ "  $_" }).join("\n");
+		~ @errors.map({ "  $_" }).join("\n")
+		~ $lever;
+	# Fires identically for both exception types — a DLQ sink sees the
+	# same payload shape it always has, with the lever line included.
 	self!fire-exhausted(@attempt-records, $summary);
-	X::LLM::Data::Inference::Exhausted.new(
+	my $ex-type = $saw-truncation
+		?? X::LLM::Data::Inference::Truncated
+		!! X::LLM::Data::Inference::Exhausted;
+	$ex-type.new(
 		attempts => @attempt-records,
 		summary  => $summary,
 	).throw;
+}
+
+#|( Resolve C<$.truncation-policy>'s empty-string sentinel into the
+    concrete policy this Task runs under. Explicit 'fail'/'accept'
+    pass through; '' derives 'fail' when a parser is installed (a
+    truncated payload can never parse, so advancing at once is the
+    only non-wasteful move) and 'accept' when one is not (truncated
+    prose is frequently still the product, and parser-less callers
+    must keep their historical behaviour). Called once per execute. )
+method !effective-truncation-policy(--> Str:D) {
+	return $!truncation-policy if $!truncation-policy.chars;
+	&!parser.defined ?? 'fail' !! 'accept';
+}
+
+#|( Abort an in-flight response.
+
+    Routes through C<Backend.cancel>, never C<Response.cancel> directly:
+    closing the local supplier is only half of a cancel. KoboldCpp's
+    override also fires C<POST /api/extra/abort> so the server stops
+    generating, instead of draining a full completion into a socket
+    nobody is reading any more. Backends with no upstream abort
+    (OpenAICommon, OpenRouter, Mock) degrade to exactly the local close
+    this used to do, so the change is free for them.
+
+    A backend whose C<cancel> throws must never leave the poll loop
+    spinning on a live response, so the bare local close is the
+    fallback. )
+method !abort-response(LLM::Chat::Backend $backend, $response --> Nil) {
+	$backend.cancel($response);
+	CATCH { default { try $response.cancel } }
 }
 
 #|( Make one chat-completion round-trip against the given backend;
@@ -451,12 +760,12 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 		my Bool $timed-out = False;
 		until $response.is-done {
 			if &!is-cancelled.defined && ?&!is-cancelled() {
-				$response.cancel;
+				self!abort-response($backend, $response);
 				$was-cancelled = True;
 				last;
 			}
 			if now > $deadline {
-				$response.cancel;
+				self!abort-response($backend, $response);
 				$timed-out = True;
 				last;
 			}
@@ -483,6 +792,13 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 			$err          = "LLM call failed: $raw-msg";
 			$error-class  = $response.error-class;
 			$error-status = $response.error-status;
+			# A quit response can still carry text it emitted before
+			# the failure — a stream cut off by the token budget is
+			# the common case. Capture it so the partial generation is
+			# available to callers instead of being dropped on the
+			# floor; the failure classification is untouched.
+			$text = $response.msg
+				if $response.msg.defined && $response.msg.chars;
 		}
 		CATCH {
 			default {
