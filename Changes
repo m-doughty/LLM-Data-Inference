@@ -2,6 +2,78 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.9.0  2026-08-09T20:28:57+01:00
+    - [2026-08-09] The retry/fallback policy this distribution
+      pioneered now lives in C<LLM::Chat::Retry> (LLM::Chat 0.8.0) so a
+      second executor can share it instead of copying it, and Task runs
+      on the shared version. Nothing about its behaviour changed: the
+      bucket table, the backoff curve (C<2 ** (n - 1)> plus 0..0.5 s of
+      jitter, capped at 30 s), the chunked cancel-aware sleep, the
+      attempt-record shape (C<raw-text> key ABSENT rather than
+      undefined when there is no body) and the telemetry payload's
+      presence-gating are the same code, moved. The public
+      C<Task.classify-error> method is B<kept> and delegates — a caller
+      holding a Task should not have to reach for another distribution
+      to ask "what would you do with this error?". Every one of this
+      distribution's thirteen pre-existing test files passes unedited,
+      which is the migration's acceptance criterion.
+    - [2026-08-09] C<X::LLM::Data::Inference::Exhausted>, C<Truncated>,
+      C<TimedOut> and C<Cancelled> are now B<subclasses> of the shared
+      C<X::LLM::Chat::Retry::*> types, so BOTH hierarchies match the
+      same throw: existing C<when X::LLM::Data::Inference::Exhausted>
+      handlers keep firing byte-for-byte identically, while an app that
+      runs a Task alongside another executor can write one generic
+      C<when X::LLM::Chat::Retry::Exhausted> arm instead of two.
+      C<Truncated> still declares C<item-retryable> C<False> (inherited
+      from its shared twin), C<TimedOut> and C<Exhausted> still
+      abstain, C<Cancelled> is still deliberately NOT an exhaustion in
+      either hierarchy, and every C<.message> string — including
+      "LLM::Data::Inference::Task: cancelled by caller after N recorded
+      attempt(s)" — is unchanged. The C<item-retryable> advice
+      contract's canonical documentation moved to
+      C<LLM::Chat::Retry::Exceptions> along with the types; the section
+      here now points at it. New C<t/14-shared-exceptions.rakutest>
+      pins the whole compatibility promise, against constructed
+      exceptions and against exceptions a real Task throws.
+    - [2026-07-29] Typed deadline exhaustion. A chain that ran out of
+      time died as a bare C<X::LLM::Data::Inference::Exhausted> whose
+      summary named no lever at all: a review step that hit its 300 s
+      deadline three times in a row reported only "all 1 backend(s)
+      exhausted" plus the raw per-attempt error, so nothing told the
+      operator that the fix was a bigger deadline (or a faster
+      backend) rather than a better model. Task now throws the new
+      C<X::LLM::Data::Inference::TimedOut> when at least one attempt
+      in the exhausted chain died on a response deadline — its own
+      C<$.timeout> firing mid-poll, or a backend reporting error
+      class 'timeout'. Like C<Truncated> it is a SUBCLASS of
+      C<Exhausted>, so DLQ routing, C<:on-exhausted> hooks and every
+      existing C<when Exhausted> handler keep working unchanged,
+      while a caller that wants to distinguish "raise the deadline"
+      from "this model cannot do the task" can match it first. The
+      summary gains a lever line quoting the deadline that was in
+      force ("At least one attempt hit the 300-second response
+      deadline before completing: raise the task timeout, use a
+      faster backend, or shrink the response."), and a chain that
+      truncated AND timed out carries BOTH lever lines — they name
+      different fixes. Precedence for the thrown TYPE is
+      C<Truncated> > C<TimedOut> > C<Exhausted>: truncation is the
+      more specific diagnosis and the deterministic one. Summaries
+      of chains that hit neither pathology are byte-identical to
+      before.
+    - [2026-07-29] C<X::LLM::Data::Inference::Truncated> now declares
+      C<method item-retryable(--> Bool:D) { False }>. A truncation is
+      deterministic — C<max_tokens> is per-backend C<Settings> state,
+      so an orchestration layer that blindly re-runs the failed item
+      re-issues the identical request and gets cut off in exactly the
+      same place, burning the whole item budget on the way to the same
+      dead-letter record. The method is duck-typed ADVICE in both
+      directions: nothing here reads it, consumers probe with C<.?>
+      and default to True when it is absent, and neither side imports
+      the other's types — so every other exception (including
+      C<TimedOut> and plain C<Exhausted>, which deliberately abstain)
+      keeps its full attempt budget. See the C<item-retryable> section
+      of the L<LLM::Data::Inference::Exceptions> Pod.
+
 0.7.0  2026-07-27T15:25:50+01:00
     - [2026-07-25] Cancellation and deadline aborts now route through
       C<Backend.cancel> instead of C<Response.cancel>. Closing the

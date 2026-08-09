@@ -45,8 +45,10 @@ through for cooperative cancellation (the Task throws
 C<X::LLM::Data::Inference::Cancelled> and aborts any in-flight
 response as soon as the hook reports True); C<:on-exhausted> threads
 through unchanged and fires exactly once, immediately before the
-chain throws C<X::LLM::Data::Inference::Exhausted> — see Task's Pod
-for the full payload shape.
+chain throws C<X::LLM::Data::Inference::Exhausted> (or one of its
+subclasses — C<Truncated> above, or C<TimedOut> when the chain ran
+out of time) — see Task's Pod for the full payload shape and the
+type precedence.
 
 C<:retry-feedback> threads through as well, and this is the class it
 was built for: it makes those C<:parse-retries> re-rolls B<informed>,

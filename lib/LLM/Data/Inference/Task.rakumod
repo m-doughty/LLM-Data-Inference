@@ -232,6 +232,47 @@ my $json = LLM::Data::Inference::JSONTask.new(
 
 =end code
 
+=head2 Typed exhaustion and levers
+
+When the chain runs out, the Task throws one of three types — all of
+them C<X::LLM::Data::Inference::Exhausted> or a subclass of it, so a
+handler that never heard of the subclasses is unaffected:
+
+=item C<Truncated> — at least one attempt was cut off by C<max_tokens>
+(only reachable under C<truncation-policy> C<'fail'>; see above).
+
+=item C<TimedOut> — at least one attempt died on a response deadline:
+C<$.timeout> firing while the Task polled the in-flight response, or a
+backend reporting error class C<'timeout'> itself.
+
+=item C<Exhausted> — everything else.
+
+B<Precedence: C<Truncated> wins over C<TimedOut>> when a chain saw
+both. It is the more specific diagnosis, and it is the deterministic
+one — it declares C<item-retryable> C<False> (see
+L<LLM::Data::Inference::Exceptions>), which tells an orchestrator to
+stop re-running the item rather than buying back retries a truncation
+guarantees will fail. C<TimedOut> makes no such claim: a deadline miss
+is transient, so it keeps its full item budget.
+
+The C<summary> (and therefore C<.message>) gains one B<lever line> per
+pathology observed, appended after the per-attempt error list. A chain
+that both truncated and timed out gets both lines — they name
+different fixes:
+
+=begin code :lang<text>
+
+LLM::Data::Inference::Task: all 2 backend(s) exhausted.
+  [backend 0 small] truncated: output was cut off by the max_tokens …
+  [backend 1 slow] timeout: response timed out after 300s
+  At least one attempt was cut off by the completion budget: raise …
+  At least one attempt hit the 300-second response deadline before …
+
+=end code
+
+Summaries of chains that hit neither are byte-identical to what they
+have always been.
+
 =head2 Telemetry
 
 Every HTTP round-trip fires C<&on-call-complete> (if provided), with
@@ -242,7 +283,8 @@ telemetry row.
 
 C<&on-exhausted> (if provided) fires exactly once, on the execute
 thread, immediately before the chain throws
-C<X::LLM::Data::Inference::Exhausted> — never on success, and never
+C<X::LLM::Data::Inference::Exhausted> B<or either of its subclasses>
+(see L</Typed exhaustion and levers>) — never on success, and never
 on the C<Cancelled> path. The payload is C<stage =E<gt> 'exhausted'>,
 C<attempts> (the same C<@attempt-records> array the thrown exception
 carries — including C<raw-text> for parse failures), C<summary> (the
@@ -308,6 +350,7 @@ read it (e.g. to label log messages with the model) keep working.
 
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Response;
+use LLM::Chat::Retry;
 use LLM::Data::Inference::Exceptions;
 use LLM::Chat::Conversation::Message;
 
@@ -373,6 +416,13 @@ has Bool:D $.retry-feedback = False;
     has. See the "Truncated output" section of the module Pod. )
 has Str:D $.truncation-policy where { $_ eq any('', 'fail', 'accept') } = '';
 
+#|( Caller-side response deadline, in seconds, applied to EVERY
+    round-trip (not to the execute as a whole). When it fires the
+    pending response is aborted through C<Backend.cancel> and the
+    attempt is classified C<'timeout'> → advance to the next backend.
+    A chain exhausted with at least one such attempt throws
+    C<X::LLM::Data::Inference::TimedOut> and names this value in the
+    summary's lever line. )
 has Num:D $.timeout = 120e0;
 
 #|( Optional telemetry hook. Fires once per HTTP round-trip,
@@ -436,28 +486,24 @@ submethod TWEAK() {
     buckets: C<'abort'>, C<'retry-same'>, or C<'advance'>. See the
     module Pod for the full rule table. Pure function — exposed on
     the class for test ergonomics, but the retry loop is the only
-    caller in normal use. )
+    caller in normal use.
+
+    Since 0.9.0 the rule table itself lives in
+    L<LLM::Chat::Retry>, so a second executor can share the policy
+    rather than copy it; this method is the (unchanged) public face
+    of it and delegates verbatim. Deliberately kept rather than
+    deprecated: it is part of this class's tested surface, and a
+    caller holding a Task should not have to reach for another
+    distribution to ask "what would you do with this error?". )
 method classify-error(
 	Str :$error-class,
 	Int :$error-status,
 	Bool :$parser-failed = False,
 	--> Str
 ) {
-	return 'advance' if $parser-failed;
-	given $error-class // 'unknown' {
-		when 'http' {
-			given $error-status // 0 {
-				when 400 | 401 | 402 | 403 | 404 { return 'abort' }
-				when 429                         { return 'advance' }
-				when 500..599                    { return 'retry-same' }
-				default                          { return 'advance' }
-			}
-		}
-		when 'timeout'    { return 'advance' }
-		when 'connection' { return 'retry-same' }
-		when 'response'   { return 'advance' }
-		default           { return 'retry-same' }
-	}
+	LLM::Chat::Retry::classify-error(
+		:$error-class, :$error-status, :$parser-failed,
+	);
 }
 
 #|( The one extra C<user> turn a C<:retry-feedback> re-roll carries.
@@ -497,12 +543,20 @@ method execute(--> Any) {
 	# enough to make the exhaustion Truncated-typed and to earn the
 	# summary its "raise the budget" line.
 	my Bool $saw-truncation = False;
+	# Its deadline twin. Sticky for the same reason, and a flag rather
+	# than something derived from @attempt-records at the end because
+	# the records keep only the rendered error STRING — error-class is
+	# live exactly once, in the network-failure branch below, and
+	# re-parsing prose to recover it would be a worse contract than
+	# setting a bit while the classification is in hand.
+	my Bool $saw-timeout = False;
 	sub record-failure(Int $backend-index, Str $model, Str $error, Str :$raw-text) {
 		@errors.push: $error;
-		my %rec = backend-index => $backend-index, model => $model,
-			error => $error;
-		%rec<raw-text> = $raw-text if $raw-text.defined;
-		@attempt-records.push: %rec;
+		# Shared record shape (raw-text key ABSENT, not undefined, when
+		# there was no body worth keeping) — see LLM::Chat::Retry.
+		@attempt-records.push: attempt-record(
+			:$backend-index, :model($model), :$error, :$raw-text,
+		);
 	}
 	sub cancelled-now(--> Bool) {
 		&!is-cancelled.defined && ?&!is-cancelled();
@@ -560,6 +614,12 @@ method execute(--> Any) {
 					error-class  => %call<error-class>,
 					error-status => %call<error-status>,
 				);
+				# Covers both flavours of "ran out of time": the
+				# caller-side deadline in !call-blocking, and a
+				# backend that classified its own failure as a
+				# timeout. Both are fixed by the same levers.
+				$saw-timeout = True
+					if (%call<error-class> // '') eq 'timeout';
 				record-failure($i, $model-name,
 					"[backend $i $model-name] "
 					~ "{%call<error-class> // 'unknown'}"
@@ -581,20 +641,16 @@ method execute(--> Any) {
 							# burst. Retry number is derived from budget
 							# consumed (max-retries minus remaining minus
 							# one); capped at 30 s. Slept in chunks so a
-							# cancel doesn't wait out the full backoff.
+							# cancel doesn't wait out the full backoff —
+							# sleep-with-cancel returns False the moment
+							# the hook flips, and only THIS layer knows
+							# which exception that becomes.
 							my $retry-n = $!max-retries - $same-retries-left;
-							my Num $wait = min(
-								(2 ** ($retry-n - 1)).Num + rand * 0.5,
-								30e0,
-							);
+							my Num $wait = retry-backoff($retry-n);
 							$same-retries-left--;
-							my Num $slept = 0e0;
-							while $slept < $wait {
-								throw-cancelled if cancelled-now;
-								my Num $chunk = min(0.25e0, $wait - $slept);
-								sleep $chunk;
-								$slept += $chunk;
-							}
+							throw-cancelled unless sleep-with-cancel(
+								$wait, cancelled => &cancelled-now,
+							);
 							next;
 						}
 						last;  # budget spent, advance
@@ -678,25 +734,40 @@ method execute(--> Any) {
 		}
 	}
 
-	# The lever line only appears when a truncation was actually
+	# A lever line only appears when its condition was actually
 	# recorded, so summaries of ordinary failures are byte-identical
-	# to what they always were.
-	my Str:D $lever = $saw-truncation
+	# to what they always were. A chain that hit both pathologies
+	# gets BOTH lines: they name different fixes, and suppressing one
+	# because the other applies would hide half the diagnosis.
+	my Str:D $lever = ($saw-truncation
 		?? "\n  At least one attempt was cut off by the completion "
 			~ "budget: raise that backend's max_tokens completion "
 			~ "budget, add a fallback backend with a larger one, or "
 			~ "shrink the request."
-		!! '';
+		!! '')
+		~ ($saw-timeout
+		?? "\n  At least one attempt hit the {$!timeout}-second "
+			~ "response deadline before completing: raise the task "
+			~ "timeout, use a faster backend, or shrink the response."
+		!! '');
 	my Str:D $summary =
 		"LLM::Data::Inference::Task: all {@!backends.elems} backend(s) exhausted.\n"
 		~ @errors.map({ "  $_" }).join("\n")
 		~ $lever;
-	# Fires identically for both exception types — a DLQ sink sees the
-	# same payload shape it always has, with the lever line included.
+	# Fires identically for every exception type — a DLQ sink sees the
+	# same payload shape it always has, with the lever lines included.
 	self!fire-exhausted(@attempt-records, $summary);
+	# Precedence: Truncated beats TimedOut when the chain saw both.
+	# It is the more specific diagnosis AND the deterministic one —
+	# it declares `item-retryable` False, so an orchestrator stops
+	# re-running the item, which is exactly the right call when the
+	# same chain also timed out somewhere. Downgrading it to TimedOut
+	# would buy back retries that a truncation guarantees will fail.
 	my $ex-type = $saw-truncation
 		?? X::LLM::Data::Inference::Truncated
-		!! X::LLM::Data::Inference::Exhausted;
+		!! ($saw-timeout
+			?? X::LLM::Data::Inference::TimedOut
+			!! X::LLM::Data::Inference::Exhausted);
 	$ex-type.new(
 		attempts => @attempt-records,
 		summary  => $summary,
@@ -830,34 +901,21 @@ method !fire-telemetry(
 	:$model-name,
 ) {
 	return unless &!on-call-complete.defined;
-	my %payload = (
-		attempt       => $attempt,
-		backend-index => $backend-index,
-		model-name    => $model-name,
-		latency-ms    => %call<elapsed-ms>,
-		success       => %call<success>.Bool,
-		stage         => 'network',
-		error         => (%call<error>.defined && %call<error>.chars) ?? %call<error> !! Str,
-		error-class   => %call<error-class>,
-		error-status  => %call<error-status>,
+	# Payload shape (which keys are always present, which are gated on
+	# the provider actually reporting them) is the shared contract —
+	# see LLM::Chat::Retry's telemetry-payload.
+	my %payload = telemetry-payload(
+		:$attempt,
+		:$backend-index,
+		:$model-name,
+		latency-ms   => %call<elapsed-ms>,
+		success      => %call<success>.Bool,
+		stage        => 'network',
+		error        => %call<error>,
+		error-class  => %call<error-class>,
+		error-status => %call<error-status>,
+		response     => %call<response>,
 	);
-	my $r = %call<response>;
-	if $r.defined {
-		# OAI-spec usage — present on any LLM::Chat::Backend::Response.
-		%payload<prompt-tokens>     = $r.prompt-tokens     if $r.prompt-tokens.defined;
-		%payload<completion-tokens> = $r.completion-tokens if $r.completion-tokens.defined;
-		%payload<total-tokens>      = $r.total-tokens      if $r.total-tokens.defined;
-		%payload<model-used>        = $r.model-used        if $r.model-used.defined;
-		%payload<finish-reason>     = $r.finish-reason     if $r.finish-reason.defined;
-		# Provider-specific extras — only on Response subclasses that
-		# expose them (e.g. LLM::Chat::Backend::Response::OpenRouter).
-		# `.?` returns Nil for Responses without the accessor, so the
-		# presence-gated contract below holds for any backend.
-		%payload<cost>           = $r.?cost           if $r.?cost.defined;
-		%payload<generation-id>  = $r.?generation-id  if $r.?generation-id.defined;
-		%payload<provider-name>  = $r.?provider-name  if $r.?provider-name.defined;
-		%payload<is-byok>        = $r.?is-byok        if $r.?is-byok.defined;
-	}
 	try {
 		&!on-call-complete(%payload);
 		CATCH { default { note "telemetry hook: {.message}" } }

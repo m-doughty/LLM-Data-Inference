@@ -202,6 +202,22 @@ $task.classify-error(error-class => 'connection');    # 'retry-same'
 $task.classify-error(:parser-failed);                 # 'advance'
 ```
 
+Since 0.9.0 the rule table itself lives in [LLM::Chat::Retry](https://raku.land/zef:apogee/LLM::Chat), together with the backoff, the cancel-aware sleep and the attempt/telemetry record shapes — the policy is shared with other executors rather than copied. This method is unchanged and delegates to it, so callers that already hold a Task need not reach for another distribution.
+
+### Exception types
+
+The four exceptions in `LLM::Data::Inference::Exceptions` are subclasses of the shared `X::LLM::Chat::Retry::*` types as of 0.9.0, so **both** hierarchies match the same throw:
+
+```raku
+# Existing handler — unchanged, still catches everything it did.
+CATCH { when X::LLM::Data::Inference::Exhausted { ... } }
+
+# New generic handler — catches Task throws AND any other executor's.
+CATCH { when X::LLM::Chat::Retry::Exhausted { ... } }
+```
+
+Attributes, `.message` strings, the attempt-record shape and the `item-retryable` advice are all unchanged.
+
 LLM::Data::Inference::JSONTask
 ------------------------------
 

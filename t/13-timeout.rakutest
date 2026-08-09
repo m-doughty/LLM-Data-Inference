@@ -1,0 +1,311 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# Typed deadline exhaustion. A chain that runs out of time used to die
+# as a bare Exhausted whose summary named no lever at all, so the
+# caller could not tell "raise the deadline" from "this model cannot
+# do the task" — and an orchestrator above it re-fired the identical
+# 300-second call twice more before dead-lettering.
+#
+# X::LLM::Data::Inference::TimedOut is thrown instead: an Exhausted
+# SUBCLASS (so every existing handler keeps working untouched) whose
+# summary carries a lever line quoting the deadline that was hit.
+# Truncated wins when a chain saw both, because it is the more
+# specific AND the deterministic diagnosis.
+
+plan 8;
+
+sub mock-failing(%err, *@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings       => LLM::Chat::Backend::Settings.new,
+		responses      => (@responses || ('(unreachable)',)),
+		error-producer => -> $i { %err },
+	);
+}
+
+sub mock-timeout() {
+	mock-failing(%( class => 'timeout', message => 'timed out' ));
+}
+
+sub mock-truncated(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+		finish-reason-producer => -> $i { 'length' },
+	);
+}
+
+sub mock-ok(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+	);
+}
+
+# A backend slow enough that the Task's own deadline is what fires,
+# rather than the backend reporting a timeout of its own.
+sub mock-slow() {
+	LLM::Chat::Backend::Mock.new(
+		settings      => LLM::Chat::Backend::Settings.new,
+		responses     => ('too slow to matter',),
+		initial-delay => 5.0,
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{') && $text.ends-with('}');
+	$text;
+};
+
+# Exactly how a duck-typed orchestrator reads the advice contract:
+# probe with .?, default True when absent, never trust the callee not
+# to throw. Mirrors LLM::Data::Pipeline::Runner's worker-side probe.
+sub advises-retryable($e --> Bool:D) {
+	(try {
+		my $advice = $e.?item-retryable;
+		$advice.defined ?? $advice.so !! True;
+	}) // True;
+}
+
+subtest 'a chain exhausted on deadlines throws TimedOut' => {
+	plan 4;
+	my $backend = mock-timeout();
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => $backend,
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::TimedOut,
+		'the deadline-specific type is thrown';
+	is $backend.call-index, 1,
+		'a timeout advances at once — no same-model re-roll';
+	is $caught.attempts.elems, 1, 'one attempt recorded';
+	like $caught.attempts[0]<error>, /'timeout'/,
+		'the attempt is recorded as a timeout';
+};
+
+subtest 'the Task-side deadline types the failure too' => {
+	plan 3;
+	# The caller-side deadline in !call-blocking is the motivating
+	# case: the backend never fails, the Task gives up on it.
+	my $backend = mock-slow();
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => $backend,
+		user-prompt => 'q',
+		parser      => &json-parser,
+		timeout     => 0.2e0,
+		max-retries => 1,
+	);
+	my $t0 = now;
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::TimedOut,
+		'the Task giving up is a TimedOut, not a bare Exhausted';
+	ok now - $t0 < 4.0,
+		'returned on the 0.2 s deadline, not the 5 s response latency';
+	like $caught.message, /'0.2-second response deadline'/,
+		'the lever quotes the deadline that actually fired';
+};
+
+subtest 'TimedOut is an Exhausted, and neither Truncated nor Cancelled' => {
+	plan 5;
+	my $caught;
+	{
+		LLM::Data::Inference::Task.new(
+			backend => mock-timeout(), user-prompt => 'q',
+		).execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Exhausted,
+		'... it IS an Exhausted';
+	nok $caught ~~ X::LLM::Data::Inference::Truncated,
+		'... but not a Truncated — nothing hit the token budget';
+	nok $caught ~~ X::LLM::Data::Inference::Cancelled,
+		'... and never a Cancelled — the caller did not withdraw';
+
+	# An untouched legacy handler must still catch it.
+	my Bool $legacy-caught = False;
+	{
+		LLM::Data::Inference::Task.new(
+			backend => mock-timeout(), user-prompt => 'q',
+		).execute;
+		CATCH {
+			when X::LLM::Data::Inference::Exhausted { $legacy-caught = True }
+		}
+	}
+	ok $legacy-caught,
+		'a bare `when Exhausted` handler catches it unchanged';
+
+	# ... and a narrower arm placed FIRST gets the specific one.
+	my Str $arm = 'none';
+	{
+		LLM::Data::Inference::Task.new(
+			backend => mock-timeout(), user-prompt => 'q',
+		).execute;
+		CATCH {
+			when X::LLM::Data::Inference::TimedOut  { $arm = 'timed-out' }
+			when X::LLM::Data::Inference::Exhausted { $arm = 'exhausted' }
+		}
+	}
+	is $arm, 'timed-out',
+		'a narrower TimedOut arm before the Exhausted arm wins';
+};
+
+subtest 'the summary names the deadline and its levers' => {
+	plan 5;
+	my $task = LLM::Data::Inference::Task.new(
+		backends    => [mock-timeout(), mock-timeout()],
+		user-prompt => 'q',
+		timeout     => 7e0,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	like $caught.message, /'7-second response deadline'/,
+		'the actual timeout value is in the lever line';
+	like $caught.message, /'raise the task timeout'/, 'lever 1';
+	like $caught.message, /'faster backend'/, 'lever 2';
+	like $caught.message, /'shrink the response'/, 'lever 3';
+	is $caught.message, $caught.summary,
+		'message is still the summary — string-matching callers unaffected';
+};
+
+subtest 'the exhausted hook carries the timeout lever too' => {
+	plan 3;
+	my @hook-calls;
+	my $task = LLM::Data::Inference::Task.new(
+		backends     => [mock-timeout(), mock-ok('not json at all')],
+		user-prompt  => 'q',
+		parser       => &json-parser,
+		timeout      => 42e0,
+		on-exhausted => -> %info { @hook-calls.push: %info },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Data::Inference::Exhausted { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::TimedOut,
+		'one timeout anywhere in the chain types the whole failure';
+	is @hook-calls.elems, 1, 'the DLQ hook still fires exactly once';
+	is @hook-calls[0]<summary>, $caught.summary,
+		'the hook sees the same summary, lever line included';
+};
+
+subtest 'Truncated wins when a chain saw both pathologies' => {
+	plan 8;
+	# Truncation is the more specific diagnosis and the deterministic
+	# one (it declares item-retryable False), so it must type the
+	# failure regardless of which pathology came first.
+	my $trunc-first = LLM::Data::Inference::Task.new(
+		backends      => [mock-truncated('{"beats": [{"first"'), mock-timeout()],
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+		timeout       => 9e0,
+	);
+	my $caught;
+	{
+		$trunc-first.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Truncated,
+		'truncation then timeout throws Truncated';
+	nok $caught ~~ X::LLM::Data::Inference::TimedOut,
+		'... and NOT a TimedOut — the two subclasses are siblings';
+	like $caught.message, /'max_tokens'/, 'the truncation lever is present';
+	like $caught.message, /'9-second response deadline'/,
+		'... alongside the timeout lever — both fixes are named';
+	is $caught.attempts.elems, 2, 'both attempts recorded';
+
+	# Order must not matter: the flags are sticky across the chain.
+	my $timeout-first = LLM::Data::Inference::Task.new(
+		backends      => [mock-timeout(), mock-truncated('{"beats"')],
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+	);
+	my $caught2;
+	{
+		$timeout-first.execute;
+		CATCH { default { $caught2 = $_ } }
+	}
+	isa-ok $caught2, X::LLM::Data::Inference::Truncated,
+		'timeout then truncation ALSO throws Truncated';
+	like $caught2.message, /'120-second response deadline'/,
+		'the default deadline is reported when it is the one in force';
+	nok advises-retryable($caught2),
+		'... and the whole point: the item stops being re-run';
+};
+
+subtest 'the advice contract: Truncated declares False, TimedOut abstains' => {
+	plan 8;
+	my $truncated = X::LLM::Data::Inference::Truncated.new(
+		summary => 'irrelevant', attempts => [],
+	);
+	is $truncated.item-retryable, False,
+		'Truncated.item-retryable is False';
+	ok $truncated.item-retryable === False,
+		'... a real Bool, not a truthy stand-in';
+	nok advises-retryable($truncated),
+		'... which a duck-typed consumer reads as "do not re-run"';
+
+	my $timed-out = X::LLM::Data::Inference::TimedOut.new(
+		summary => 'irrelevant', attempts => [],
+	);
+	nok $timed-out.^can('item-retryable'),
+		'TimedOut does not define item-retryable at all';
+	ok ($timed-out.?item-retryable) === Nil,
+		'... so the .? probe returns Nil';
+	ok advises-retryable($timed-out),
+		'... and an absent method defaults to retryable';
+
+	my $plain = X::LLM::Data::Inference::Exhausted.new(
+		summary => 'irrelevant', attempts => [],
+	);
+	nok $plain.^can('item-retryable'),
+		'plain Exhausted abstains too';
+	ok advises-retryable($plain),
+		'... and is therefore retryable, exactly as before 0.8.0';
+};
+
+subtest 'a chain that hit neither pathology is unchanged' => {
+	plan 4;
+	my $task = LLM::Data::Inference::Task.new(
+		backends    => [mock-ok('nope'), mock-ok('still nope')],
+		user-prompt => 'q',
+		parser      => &json-parser,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { default { $caught = $_ } }
+	}
+	isa-ok $caught, X::LLM::Data::Inference::Exhausted,
+		'still a plain Exhausted';
+	nok $caught ~~ X::LLM::Data::Inference::TimedOut, '... not a TimedOut';
+	nok $caught ~~ X::LLM::Data::Inference::Truncated, '... not a Truncated';
+	is $caught.message,
+		"LLM::Data::Inference::Task: all 2 backend(s) exhausted.\n"
+		~ "  [backend 0 unknown] parser: not json\n"
+		~ "  [backend 1 unknown] parser: not json",
+		'the summary is byte-identical to the historical one — no levers';
+};
+
+done-testing;

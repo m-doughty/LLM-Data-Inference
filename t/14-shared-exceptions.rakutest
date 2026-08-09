@@ -1,0 +1,258 @@
+use Test;
+use lib 'lib', '../LLM-Chat/lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Retry::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# 0.9.0 moved the retry policy — and with it the exception types —
+# into LLM::Chat::Retry, and made this distribution's four exceptions
+# SUBCLASSES of the shared ones. That is a compatibility promise in
+# both directions, and this file is where it is pinned:
+#
+#   * every handler written against X::LLM::Data::Inference::* keeps
+#     firing, byte-for-byte identically (the other thirteen test files
+#     in this directory are the real proof of that — they were not
+#     touched by the migration);
+#   * a NEW handler written against X::LLM::Chat::Retry::* fires on
+#     the very same throws, so an app that runs a Task alongside some
+#     other executor can write one `when` arm instead of two.
+#
+# Both halves are checked against constructed exceptions AND against
+# exceptions a real Task actually throws, because the type the Task
+# selects is the part a refactor can silently get wrong.
+
+plan 12;
+
+sub mock-failing(%err) {
+	LLM::Chat::Backend::Mock.new(
+		settings       => LLM::Chat::Backend::Settings.new,
+		responses      => ('(unreachable)',),
+		error-producer => -> $i { %err },
+	);
+}
+
+sub mock-truncated(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings               => LLM::Chat::Backend::Settings.new,
+		responses              => @responses,
+		finish-reason-producer => -> $i { 'length' },
+	);
+}
+
+sub mock-seq(*@responses) {
+	LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => @responses,
+	);
+}
+
+my &json-parser = sub (Str:D $text) {
+	die "not json" unless $text.starts-with('{');
+	$text;
+};
+
+# --- constructed exceptions: dual hierarchy ---------------------------
+
+subtest 'Exhausted matches both hierarchies' => {
+	plan 4;
+	my $ex = X::LLM::Data::Inference::Exhausted.new(summary => 's');
+	ok $ex ~~ X::LLM::Data::Inference::Exhausted, 'the inference type';
+	ok $ex ~~ X::LLM::Chat::Retry::Exhausted, 'AND the shared type';
+	nok $ex ~~ X::LLM::Chat::Retry::Truncated, 'but not a shared subclass';
+	nok $ex ~~ X::LLM::Chat::Retry::TimedOut, 'nor the other one';
+};
+
+subtest 'Truncated matches four types at once' => {
+	plan 5;
+	my $ex = X::LLM::Data::Inference::Truncated.new(summary => 's');
+	ok $ex ~~ X::LLM::Data::Inference::Truncated, 'its own type';
+	ok $ex ~~ X::LLM::Data::Inference::Exhausted,
+		'the inference base — existing DLQ routing still catches it';
+	ok $ex ~~ X::LLM::Chat::Retry::Truncated, 'the shared truncation type';
+	ok $ex ~~ X::LLM::Chat::Retry::Exhausted, 'the shared base';
+	nok $ex ~~ X::LLM::Data::Inference::TimedOut, 'and not its sibling';
+};
+
+subtest 'TimedOut matches four types at once' => {
+	plan 5;
+	my $ex = X::LLM::Data::Inference::TimedOut.new(summary => 's');
+	ok $ex ~~ X::LLM::Data::Inference::TimedOut, 'its own type';
+	ok $ex ~~ X::LLM::Data::Inference::Exhausted, 'the inference base';
+	ok $ex ~~ X::LLM::Chat::Retry::TimedOut, 'the shared deadline type';
+	ok $ex ~~ X::LLM::Chat::Retry::Exhausted, 'the shared base';
+	nok $ex ~~ X::LLM::Data::Inference::Truncated, 'and not its sibling';
+};
+
+subtest 'Cancelled is not an exhaustion in EITHER hierarchy' => {
+	plan 4;
+	my $ex = X::LLM::Data::Inference::Cancelled.new;
+	ok $ex ~~ X::LLM::Data::Inference::Cancelled, 'the inference type';
+	ok $ex ~~ X::LLM::Chat::Retry::Cancelled, 'AND the shared type';
+	nok $ex ~~ X::LLM::Data::Inference::Exhausted,
+		'a user cancel must never reach an exhaustion handler';
+	nok $ex ~~ X::LLM::Chat::Retry::Exhausted,
+		'...not even a shared-hierarchy one';
+};
+
+subtest 'inherited attributes and message' => {
+	plan 6;
+	# @.attempts and $.summary now live in the LLM::Chat parent. If the
+	# subclass had redeclared them, .message would read the wrong one.
+	my @attempts = (
+		%(backend-index => 0, model => 'a', error => 'boom'),
+		%(backend-index => 1, model => 'b', error => 'bang', raw-text => 'x'),
+	);
+	my $ex = X::LLM::Data::Inference::Truncated.new(
+		:@attempts, summary => 'all 2 backend(s) exhausted.',
+	);
+	is $ex.attempts.elems, 2, 'attempts survive the inheritance';
+	is $ex.attempts[1]<raw-text>, 'x', 'record contents are untouched';
+	nok $ex.attempts[0]<raw-text>:exists,
+		'and a record without raw-text still has no such key';
+	is $ex.summary, 'all 2 backend(s) exhausted.', 'summary accessor';
+	is $ex.message, 'all 2 backend(s) exhausted.',
+		'message is still the summary verbatim';
+	dies-ok { X::LLM::Data::Inference::Exhausted.new },
+		'the required summary is still required';
+};
+
+subtest 'Cancelled message strings are byte-identical to 0.8.0' => {
+	plan 3;
+	is X::LLM::Data::Inference::Cancelled.new.message,
+		'LLM::Data::Inference::Task: cancelled by caller',
+		'no attempts: no suffix';
+	# NB the trailing comma: `[ %h ]` hits the single-arg rule and
+	# flattens the Hash into its three Pairs, which would silently make
+	# this a THREE-attempt exception.
+	is X::LLM::Data::Inference::Cancelled.new(
+		attempts => [%(backend-index => 0, model => 'm', error => 'e'), ],
+	).message,
+		'LLM::Data::Inference::Task: cancelled by caller after 1 recorded attempt(s)',
+		'one attempt: singular count, plural spelling';
+	is X::LLM::Data::Inference::Cancelled.new(attempts => [1, 2, 3]).message,
+		'LLM::Data::Inference::Task: cancelled by caller after 3 recorded attempt(s)',
+		'three attempts';
+};
+
+subtest 'the message override does NOT leak the shared wording' => {
+	plan 2;
+	# The parent says 'LLM call cancelled by caller'. This distribution
+	# names the Task, and must keep doing so — a log line that suddenly
+	# stopped naming the layer would be a real regression.
+	my $inf = X::LLM::Data::Inference::Cancelled.new(attempts => [1]);
+	my $chat = X::LLM::Chat::Retry::Cancelled.new(attempts => [1]);
+	is $inf.message,
+		'LLM::Data::Inference::Task: cancelled by caller after 1 recorded attempt(s)',
+		'the subclass wording wins';
+	is $chat.message, 'LLM call cancelled by caller after 1 recorded attempt(s)',
+		'and the parent keeps its own';
+};
+
+subtest 'item-retryable advice survives the move' => {
+	plan 4;
+	is X::LLM::Data::Inference::Truncated.new(summary => 's').?item-retryable,
+		False, 'Truncated still advises against a blind item re-run';
+	nok X::LLM::Data::Inference::TimedOut.new(summary => 's').?item-retryable.defined,
+		'TimedOut still abstains — a deadline miss is transient';
+	nok X::LLM::Data::Inference::Exhausted.new(summary => 's').?item-retryable.defined,
+		'plain Exhausted still abstains';
+	nok X::LLM::Data::Inference::Cancelled.new.?item-retryable.defined,
+		'Cancelled still abstains';
+};
+
+# --- exceptions a real Task throws ------------------------------------
+
+subtest 'a real exhausted chain is caught by a shared-type handler' => {
+	plan 4;
+	my $task = LLM::Data::Inference::Task.new(
+		backends => [
+			mock-failing(%( class => 'http', status => 429, message => 'slow down' )),
+			mock-failing(%( class => 'http', status => 429, message => 'slow down' )),
+		],
+		user-prompt => 'q',
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Chat::Retry::Exhausted { $caught = $_ } }
+	}
+	ok $caught.defined, 'a generic retry handler catches it';
+	ok $caught ~~ X::LLM::Data::Inference::Exhausted,
+		'and it is still the inference type underneath';
+	is $caught.attempts.elems, 2, 'both attempts recorded';
+	like $caught.message, /'all 2 backend(s) exhausted'/,
+		'summary unchanged';
+};
+
+subtest 'a real truncated chain carries the advice through' => {
+	plan 4;
+	my $task = LLM::Data::Inference::Task.new(
+		backend       => mock-truncated('{"beats": [{"first": 0,'),
+		user-prompt   => 'q',
+		parser        => &json-parser,
+		parse-retries => 2,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Chat::Retry::Truncated { $caught = $_ } }
+	}
+	ok $caught.defined,
+		'a shared-hierarchy Truncated arm catches the Task throw';
+	ok $caught ~~ X::LLM::Data::Inference::Truncated, 'still the inference type';
+	is $caught.?item-retryable, False,
+		'and an orchestrator is still told not to re-run the item';
+	is $caught.attempts[0]<raw-text>, '{"beats": [{"first": 0,',
+		'the partial output survives';
+};
+
+subtest 'a real deadline exhaustion is caught by the shared TimedOut' => {
+	plan 3;
+	my $task = LLM::Data::Inference::Task.new(
+		backend     => mock-failing(%( class => 'timeout', message => 'timed out' )),
+		user-prompt => 'q',
+		max-retries => 1,
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Chat::Retry::TimedOut { $caught = $_ } }
+	}
+	ok $caught.defined, 'a shared TimedOut arm catches it';
+	ok $caught ~~ X::LLM::Data::Inference::Exhausted,
+		'and it is still an inference exhaustion';
+	nok $caught.?item-retryable.defined,
+		'still no advice — the item keeps its full budget';
+};
+
+subtest 'a real cancel is caught by the shared Cancelled, with its own message' => {
+	plan 4;
+	# One parse failure is recorded, then the hook flips: exactly the
+	# 'after 1 recorded attempt(s)' shape.
+	my $backend = mock-seq('garbage', '{"ok":true}');
+	my Bool $cancel = False;
+	my $task = LLM::Data::Inference::Task.new(
+		backend          => $backend,
+		user-prompt      => 'q',
+		parser           => &json-parser,
+		parse-retries    => 2,
+		on-call-complete => -> %info { $cancel = True },
+		is-cancelled     => -> { $cancel },
+	);
+	my $caught;
+	{
+		$task.execute;
+		CATCH { when X::LLM::Chat::Retry::Cancelled { $caught = $_ } }
+	}
+	ok $caught.defined, 'a shared Cancelled arm catches the Task throw';
+	nok $caught ~~ X::LLM::Chat::Retry::Exhausted,
+		'and it is still not an exhaustion in either hierarchy';
+	is $caught.attempts.elems, 1, 'the one failed attempt is on record';
+	is $caught.message,
+		'LLM::Data::Inference::Task: cancelled by caller after 1 recorded attempt(s)',
+		"with this distribution's own wording, unchanged";
+};
+
+done-testing;

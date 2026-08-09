@@ -6,7 +6,7 @@
   "build-depends": [
   ],
   "depends": [
-    "LLM::Chat:ver<0.7.1>:auth<zef:apogee>",
+    "LLM::Chat:ver<0.8.0>:auth<zef:apogee>",
     "Roaring::Tags:auth<zef:apogee>",
     "CRoaring:auth<zef:apogee>",
     "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
@@ -34,5 +34,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.7.0"
+  "version": "0.9.0"
 }
