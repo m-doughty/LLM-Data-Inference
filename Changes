@@ -2,6 +2,41 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.11.0  2026-10-25T13:52:31Z
+
+    - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)
+      fails its own tests under the RakuAST compiler frontend that Rakudo
+      2026.09 makes the default, so installing this distribution stopped
+      at that dependency.
+    - DOCS: the C<:&is-cancelled> prose and C<!abort-response>'s
+      declarator Pod now agree: an OpenAI-compatible backend's cancel
+      stops server-side generation by hanging up the HTTP exchange,
+      which openai-compat servers treat as the abort signal, matching
+      LLM::Chat's current cancel behaviour.
+    - [2026-10-24] A hook or backend error whose exception has no message
+      (a class defining neither a C<message> method nor a C<$.message>
+      attribute, such as Cro's C<PipelineClosedBeforeHeaders>) no longer
+      makes the task die while reporting it. Rakudo's base
+      C<Exception.message> is a stub that throws when used as text, so the
+      C<.message> in the on-call-complete and on-exhausted hook shields,
+      the backend-failure record and the parser-error record threw a
+      second exception from inside the handler, which kills a worker
+      thread. Each now reads the text through
+      C<LLM::Chat::ExceptionText>, naming the exception class when there
+      is no message. Requires LLM::Chat 0.10.3 or later: 0.10.1 is the
+      first release that ships C<LLM::Chat::ExceptionText>, 0.10.2 the
+      first whose test suite passes on Rakudo 2026.07, and 0.10.3 the
+      first that installs on a machine without its dependencies already
+      installed.
+    - [2026-10-25] t/15, the test for the change above, could fail about
+      one run in 270 with "WARNING: unhandled Failure detected in
+      DESTROY" in its third subtest. Its first subtest made the stub's
+      Failure inside a C<try>, which throws such a Failure without
+      marking it handled; when garbage collection happened to collect it
+      during a later subtest, the warning landed in that subtest's
+      captured stderr. The subtest now binds the Failure first, uses it
+      as text inside the C<try>, then marks it handled.
+
 0.10.0  2026-08-21T22:44:11+01:00
     - LLM::Chat pin: 0.8.0 exact -> 0.10.0+. The exact pin named the one
       release whose META was broken on fresh installs (provides-dropped

@@ -317,9 +317,12 @@ between backoff sleeps, and before parse re-rolls / backend advances.
 
 Aborting through C<Backend.cancel> rather than C<Response.cancel> is
 what makes the cancel reach the server: against KoboldCpp it fires
-C<POST /api/extra/abort> alongside the local stream close, so a
-cancelled Task stops the generation instead of only looking away from
-it. Backends with no upstream abort endpoint degrade to a local close.
+C<POST /api/extra/abort> alongside the local stream close, and against
+an OpenAI-compatible backend it hangs up the HTTP exchange at the
+socket instead, which openai-compat servers treat as their own abort
+signal — either way, a cancelled Task stops the generation instead of
+only looking away from it. A backend with neither upstream signal
+degrades to a local close.
 When it returns True the Task throws
 C<X::LLM::Data::Inference::Cancelled> (see
 L<LLM::Data::Inference::Exceptions>) carrying whatever attempt records
@@ -351,6 +354,7 @@ read it (e.g. to label log messages with the model) keep working.
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Retry;
+use LLM::Chat::ExceptionText;
 use LLM::Data::Inference::Exceptions;
 use LLM::Chat::Conversation::Message;
 
@@ -708,7 +712,7 @@ method execute(--> Any) {
 				CATCH {
 					default {
 						$parse-failed = True;
-						$parse-error  = ~$_.message;
+						$parse-error  = exception-text($_);
 					}
 				}
 			}
@@ -792,9 +796,11 @@ method !effective-truncation-policy(--> Str:D) {
     closing the local supplier is only half of a cancel. KoboldCpp's
     override also fires C<POST /api/extra/abort> so the server stops
     generating, instead of draining a full completion into a socket
-    nobody is reading any more. Backends with no upstream abort
-    (OpenAICommon, OpenRouter, Mock) degrade to exactly the local close
-    this used to do, so the change is free for them.
+    nobody is reading any more. OpenAI-compatible backends
+    (OpenAICommon, OpenRouter) terminate the HTTP exchange at the
+    socket, which openai-compat servers treat as their abort signal —
+    the server stops generating when the client disconnects. Mock
+    degrades to the local close, which for it is the whole job.
 
     A backend whose C<cancel> throws must never leave the poll loop
     spinning on a live response, so the bare local close is the
@@ -858,7 +864,7 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 		else {
 			my $raw = $response.err;
 			my $raw-msg = $raw.defined
-				?? ($raw ~~ Exception ?? $raw.message !! ~$raw)
+				?? ($raw ~~ Exception ?? exception-text($raw) !! ~$raw)
 				!! 'unknown error';
 			$err          = "LLM call failed: $raw-msg";
 			$error-class  = $response.error-class;
@@ -873,7 +879,7 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 		}
 		CATCH {
 			default {
-				$err         = "LLM::Data::Inference::Task: {$_.message}";
+				$err         = "LLM::Data::Inference::Task: {exception-text($_)}";
 				$error-class = 'unknown';
 			}
 		}
@@ -918,7 +924,7 @@ method !fire-telemetry(
 	);
 	try {
 		&!on-call-complete(%payload);
-		CATCH { default { note "telemetry hook: {.message}" } }
+		CATCH { default { note "telemetry hook: {exception-text($_)}" } }
 	}
 }
 
@@ -936,6 +942,6 @@ method !fire-exhausted(@attempt-records, Str:D $summary) {
 	);
 	try {
 		&!on-exhausted(%payload);
-		CATCH { default { note "exhausted hook: {.message}" } }
+		CATCH { default { note "exhausted hook: {exception-text($_)}" } }
 	}
 }

@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', '../LLM-Chat/lib';
+use lib 'lib';
 use LLM::Data::Inference::Task;
 use LLM::Data::Inference::JSONTask;
 use LLM::Chat::Backend::Mock;

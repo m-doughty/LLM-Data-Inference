@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', '../LLM-Chat/lib';
+use lib 'lib';
 use LLM::Data::Inference::Task;
 use LLM::Data::Inference::JSONTask;
 use LLM::Data::Inference::Exceptions;
@@ -12,6 +12,26 @@ use LLM::Chat::Backend::Settings;
 # shielded without altering the Exhausted throw.
 
 plan 6;
+
+# Stands in for $*ERR so a hook's `note` is asserted on instead of
+# leaking onto the test run's stderr (zef shows it during install).
+class ErrCapture {
+	has Str $.text = '';
+	method print(*@args) { $!text ~= @args.join; True }
+	method say(*@args)   { $!text ~= @args.join ~ "\n"; True }
+	method put(*@args)   { $!text ~= @args.join ~ "\n"; True }
+	method print-nl      { $!text ~= "\n"; True }
+	method flush         { True }
+}
+
+sub with-captured-err(&code --> Str:D) {
+	my $capture = ErrCapture.new;
+	{
+		my $*ERR = $capture;
+		code();
+	}
+	$capture.text;
+}
 
 sub mock-failing(%error-hash) {
 	LLM::Chat::Backend::Mock.new(
@@ -130,7 +150,7 @@ subtest 'hook NOT fired on cancellation' => {
 };
 
 subtest 'a hook that dies is shielded — Exhausted still thrown' => {
-	plan 3;
+	plan 4;
 	my $b1 = mock-failing({ class => 'timeout', message => 'timed out' });
 	my $task = LLM::Data::Inference::Task.new(
 		backend      => $b1,
@@ -139,17 +159,19 @@ subtest 'a hook that dies is shielded — Exhausted still thrown' => {
 	);
 	my $caught;
 	my $died = False;
-	{
+	my $noted = with-captured-err({
 		$task.execute;
 		CATCH {
 			when X::LLM::Data::Inference::Exhausted { $caught = $_ }
 			default { $died = True }
 		}
-	}
+	});
 	ok $caught.defined, 'Exhausted still thrown despite the throwing hook';
 	nok $died, 'no other exception leaked out of execute';
 	like $caught.message, /'exhausted'/,
 		'exception summary is intact — the hook did not alter it';
+	is $noted, "exhausted hook: boom, broken hook\n",
+		'the shielded hook failure was reported on $*ERR, nowhere else';
 };
 
 subtest 'JSONTask forwards on-exhausted to the inner Task' => {

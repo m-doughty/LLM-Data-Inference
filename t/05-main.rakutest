@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', '../LLM_Chat/lib', '../CRoaring/lib', '../Roaring-Tags/lib';
+use lib 'lib';
 use LLM::Data::Inference;
 use LLM::Data::Inference::Task;
 use LLM::Data::Inference::JSONTask;

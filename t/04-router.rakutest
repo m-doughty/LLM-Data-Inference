@@ -1,5 +1,5 @@
 use Test;
-use lib 'lib', '../LLM_Chat/lib', '../CRoaring/lib', '../Roaring-Tags/lib';
+use lib 'lib';
 use LLM::Data::Inference::Router;
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Settings;
