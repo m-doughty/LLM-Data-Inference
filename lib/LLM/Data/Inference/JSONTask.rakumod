@@ -62,6 +62,9 @@ Each re-roll replaces the previous feedback, and only re-rolls against
 the same backend are informed — see Task's "Retry feedback" Pod
 section for the full rules.
 
+C<:empty-retries> threads through unchanged. It defaults to zero and
+permits only the narrow empty-completion recovery described in Task.
+
 Accepts either C<:$backend> (single) or C<:@backends> (chain); both
 forms thread through to the inner Task unchanged.
 
@@ -94,6 +97,9 @@ has Int:D $.max-retries = 3;
 #| Same-backend re-roll budget for parse/validation failures —
 #| threaded through to the inner Task (see its Pod for the trade-off).
 has UInt:D $.parse-retries = 0;
+
+#| Whole-execute empty-completion allowance, threaded through to Task.
+has UInt:D $.empty-retries = 0;
 
 #|( Give parse re-rolls the rejection reason, threaded through to the
     inner Task — see its "Retry feedback" Pod section. A JSON task is
@@ -175,6 +181,7 @@ method execute(--> Any) {
 		:$!user-prompt,
 		:$!max-retries,
 		:$!parse-retries,
+		:$!empty-retries,
 		:$!retry-feedback,
 		:$!truncation-policy,
 		:$!timeout,

@@ -1,0 +1,210 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+class RecordingMock is LLM::Chat::Backend::Mock {
+	has @.inputs;
+	has Bool $.with-tools = False;
+	method chat-completion(|args) {
+		@!inputs.push(args[0].map({ [ .role, .content ] }).Array);
+		my $response = callsame;
+		$response._set-tool-calls([%(id => 'call-1', type => 'function',
+			function => %(name => 'lookup', arguments => '{}'))]) if $!with-tools;
+		$response;
+	}
+}
+sub backend(@responses, *%options) {
+	RecordingMock.new(settings => LLM::Chat::Backend::Settings.new,
+		:@responses, |%options);
+}
+sub caught(&work) {
+	my $error;
+	try { work(); CATCH { default { $error = $_ } } }
+	$error;
+}
+sub task($backend, *%options) {
+	LLM::Data::Inference::Task.new(:$backend, user-prompt => 'Synthetic input',
+		max-retries => 0, |%options);
+}
+
+subtest 'opt-in empty and whitespace recovery preserves each request' => {
+	for '', " \n\t" -> $empty {
+		for 'stop', Str -> $finish {
+			my $b = backend([$empty, 'answer'], finish-reason-producer => -> $i { $finish });
+			my @events;
+			is task($b, empty-retries => 1,
+				on-call-complete => -> %p { @events.push(%p) }).execute,
+				'answer', 'second completion succeeds';
+			is $b.call-index, 2, 'exactly one additional send';
+			is-deeply $b.inputs[0], $b.inputs[1], 'identical request content';
+			is @events.elems, 2, 'both attempts remain observable';
+			is @events[0]<answer-chars>, $empty.chars, 'first answer character count preserved';
+			nok @events[0]<reasoning-chars>:exists, 'unreported reasoning is absent';
+		}
+	}
+};
+
+subtest 'two empty results exhaust once with safe evidence' => {
+	my $b = backend(['', ''], fake-usage => %(prompt => 42, completion => 3, total => 45),
+		finish-reason-producer => -> $i { 'stop' });
+	my $error = caught { task($b, empty-retries => 1).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $b.call-index, 2, 'bounded at two sends';
+	is $error.attempts.elems, 2, 'first failed attempt retained';
+	is $error.attempts[0]<response-metadata><answer-chars>, 0, 'empty count recorded';
+	is $error.attempts[0]<response-metadata><completion-tokens>, 3, 'reported usage retained';
+	like $error.message, /'empty response body'/, 'existing error prefix retained';
+	like $error.message, /'reasoning-chars=unknown'/, 'missing reasoning is not invented';
+	like $error.message, /'finish-reason=stop'/, 'finish reason named';
+	like $error.message, /'prompt-tokens=42'/, 'usage appears in failure summary';
+	nok $error.attempts[0]<raw-text>:exists, 'no content added to empty attempt records';
+};
+
+subtest 'missing and empty finish metadata remain unknown, numeric zeros remain known' => {
+	for Str, '' -> $finish {
+		my $b = backend([''], finish-reason-producer => -> $i { $finish },
+			fake-usage => %(prompt => 0, completion => 0, total => 0));
+		my %event;
+		my $error = caught { task($b, on-call-complete => -> %p { %event = %p }).execute };
+		nok %event<finish-reason>:exists, 'empty finish is absent in telemetry too';
+		nok $error.attempts[0]<response-metadata><finish-reason>:exists;
+		like $error.message, /'finish-reason=unknown'/;
+		is $error.attempts[0]<response-metadata><completion-tokens>, 0;
+		like $error.message, /'completion-tokens=0'/;
+	}
+};
+
+subtest 'reasoning and tool calls never use empty allowance' => {
+	for %(fake-reasoning => 'Private synthetic reasoning'), %(with-tools => True) -> %options {
+		my $b = backend(['', 'answer'], |%options);
+		my $error = caught { task($b, empty-retries => 1).execute };
+		isa-ok $error, X::LLM::Data::Inference::Exhausted;
+		is $b.call-index, 1, 'one send only';
+		nok $error.message.contains('Private synthetic reasoning'), 'reasoning text is not logged';
+		if %options<fake-reasoning>:exists {
+			is $error.attempts[0]<response-metadata><reasoning-chars>,
+				%options<fake-reasoning>.chars, 'reasoning count remains useful';
+		}
+	}
+};
+
+subtest 'non-stop finishes never retry and truncation remains typed' => {
+	for <length content_filter tool_calls function_call unknown> -> $finish {
+		my $b = backend(['', 'answer'], finish-reason-producer => -> $i { $finish });
+		my $error = caught { task($b, empty-retries => 1, truncation-policy => 'fail').execute };
+		isa-ok $error, ($finish eq 'length'
+			?? X::LLM::Data::Inference::Truncated !! X::LLM::Data::Inference::Exhausted);
+		is $b.call-index, 1, "$finish does not retry";
+	}
+	my $b = backend([''], finish-reason-producer => -> $i { 'length' });
+	isa-ok caught({ task($b, empty-retries => 1, truncation-policy => 'accept').execute }),
+		X::LLM::Data::Inference::Exhausted, 'accept policy still cannot retry empty length';
+	is $b.call-index, 1;
+};
+
+subtest 'cancellation after first completion prevents the second call' => {
+	my Bool $cancel = False;
+	my $b = backend(['', 'answer']);
+	my $error = caught {
+		task($b, empty-retries => 1, is-cancelled => -> { $cancel },
+			on-call-complete => -> %p { $cancel = True }).execute;
+	};
+	isa-ok $error, X::LLM::Data::Inference::Cancelled;
+	is $b.call-index, 1;
+	is $error.attempts.elems, 1, 'first empty evidence survives cancellation';
+};
+
+subtest 'network and auth failures do not spend the empty allowance' => {
+	for %(class => 'connection', message => 'synthetic connection failure'),
+		%(class => 'http', status => 401, message => 'synthetic auth failure'),
+		%(class => 'timeout', message => 'synthetic deadline') -> %failure {
+		my $b = backend(['answer'], error-producer => -> $i { %failure });
+		my $error = caught { task($b, empty-retries => 1).execute };
+		ok $error.defined, 'error still propagates';
+		is $b.call-index, 1, 'no additional send';
+		isa-ok $error, X::LLM::Data::Inference::TimedOut if %failure<class> eq 'timeout';
+		like $error.message, /'aborting on http 401'/ if %failure<status>;
+	}
+};
+
+subtest 'default zero preserves empty and whitespace behavior' => {
+	my $empty = backend(['', 'answer']);
+	isa-ok caught({ task($empty).execute }), X::LLM::Data::Inference::Exhausted;
+	is $empty.call-index, 1;
+	my $spaces = backend([" \n"]);
+	is task($spaces).execute, " \n", 'legacy raw whitespace is returned';
+	my $json = backend([" \n", '{"ok":true}']);
+	my $error = caught {
+		LLM::Data::Inference::JSONTask.new(backend => $json, user-prompt => 'q').execute;
+	};
+	like $error.message, /'parser:'/ , 'legacy JSON whitespace remains a parser failure';
+	is $json.call-index, 1;
+	dies-ok { task(backend(['']), empty-retries => -1) }, 'negative allowance rejected';
+};
+
+subtest 'JSONTask forwards allowance but malformed JSON cannot use it' => {
+	my $b = backend(['', '{"ok":true}']);
+	ok LLM::Data::Inference::JSONTask.new(backend => $b, user-prompt => 'q',
+		empty-retries => 1, max-retries => 0).execute<ok>;
+	is $b.call-index, 2;
+	my $bad = backend(['not json', '{"ok":true}']);
+	isa-ok caught({ LLM::Data::Inference::JSONTask.new(backend => $bad,
+		user-prompt => 'q', empty-retries => 1, max-retries => 0).execute }),
+		X::LLM::Data::Inference::Exhausted;
+	is $bad.call-index, 1;
+};
+
+subtest 'one allowance spans fallback backends' => {
+	my $first = backend(['', 'bad']);
+	my $second = backend(['', 'answer']);
+	my $error = caught { LLM::Data::Inference::JSONTask.new(
+		backends => [$first, $second], user-prompt => 'q', empty-retries => 1,
+		max-retries => 0).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $first.call-index, 2;
+	is $second.call-index, 1, 'fallback does not refill allowance';
+	is $error.attempts.elems, 3;
+};
+
+subtest 'parser and network retries cannot refill allowance' => {
+	my $parse = backend(['', 'bad', '', '{"ok":true}']);
+	my $error = caught { LLM::Data::Inference::JSONTask.new(backend => $parse,
+		user-prompt => 'q', empty-retries => 1, parse-retries => 1,
+		max-retries => 0, retry-feedback => True).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $parse.call-index, 3, 'parse retry does not refill allowance';
+	my $network = backend(['', '', 'answer'], error-producer => -> $i {
+		$i == 1 ?? %(class => 'connection', message => 'synthetic drop') !! Nil
+	});
+	my $network-error = caught { LLM::Data::Inference::Task.new(backend => $network,
+		user-prompt => 'q', empty-retries => 1, max-retries => 2).execute };
+	isa-ok $network-error, X::LLM::Data::Inference::Exhausted;
+	is $network.call-index, 3, 'network retry does not refill allowance';
+};
+
+subtest 'larger allowance is finite and feedback is preserved unchanged' => {
+	my $b = backend(['', '', 'answer']);
+	is task($b, empty-retries => 2).execute, 'answer';
+	is $b.call-index, 3, 'allowance two grants exactly two additional sends';
+	my $feedback = backend(['bad', '', '{"ok":true}']);
+	ok LLM::Data::Inference::JSONTask.new(backend => $feedback,
+		user-prompt => 'q', empty-retries => 1, parse-retries => 1,
+		max-retries => 0, retry-feedback => True).execute<ok>;
+	is $feedback.inputs[1].elems, 2, 'parse feedback was present before empty response';
+	is-deeply $feedback.inputs[1], $feedback.inputs[2],
+		'empty retry neither removes nor appends pending feedback';
+};
+
+subtest 'allowance resets only for a new execute' => {
+	my $b = backend(['', 'one', '', 'two']);
+	my $task = task($b, empty-retries => 1);
+	is $task.execute, 'one';
+	is $task.execute, 'two';
+	is $b.call-index, 4;
+};
+
+done-testing;

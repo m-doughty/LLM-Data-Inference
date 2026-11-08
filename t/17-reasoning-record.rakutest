@@ -1,0 +1,143 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+# The thinking a reasoning model produced rides every attempt record
+# that had a Response carrying some, under `reasoning-text`, on the
+# same presence rule as `raw-text`: the key is absent when there was
+# none. The trace never reaches the summary.
+
+constant THOUGHT = 'Synthetic private deliberation about the answer';
+
+sub backend(@responses, *%options) {
+	LLM::Chat::Backend::Mock.new(settings => LLM::Chat::Backend::Settings.new,
+		:@responses, |%options);
+}
+sub caught(&work) {
+	my $error;
+	try { work(); CATCH { default { $error = $_ } } }
+	$error;
+}
+sub task($backend, *%options) {
+	LLM::Data::Inference::Task.new(:$backend, user-prompt => 'Synthetic input',
+		max-retries => 0, |%options);
+}
+
+subtest 'an empty body keeps the thinking that consumed the completion' => {
+	my $b = backend([''], fake-reasoning => THOUGHT,
+		finish-reason-producer => -> $i { 'stop' });
+	my $error = caught { task($b).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $error.attempts.elems, 1, 'one attempt recorded';
+	is $error.attempts[0]<reasoning-text>, THOUGHT, 'the trace is on the record';
+	nok $error.attempts[0]<raw-text>:exists, 'an empty body still has no raw-text';
+	is $error.attempts[0]<response-metadata><reasoning-chars>, THOUGHT.chars,
+		'the content-free count is unchanged';
+	nok $error.message.contains(THOUGHT), 'the summary never quotes the trace';
+};
+
+subtest 'a truncated attempt keeps both the partial body and the thinking' => {
+	my $b = backend(['{"half":'], fake-reasoning => THOUGHT,
+		finish-reason-producer => -> $i { 'length' });
+	my $error = caught { task($b, truncation-policy => 'fail').execute };
+	isa-ok $error, X::LLM::Data::Inference::Truncated;
+	is $error.attempts[0]<raw-text>, '{"half":', 'partial output kept';
+	is $error.attempts[0]<reasoning-text>, THOUGHT, 'trace kept beside it';
+};
+
+subtest 'a parser failure keeps the thinking beside the raw output' => {
+	my $b = backend(['not json at all'], fake-reasoning => THOUGHT);
+	my $error = caught {
+		LLM::Data::Inference::JSONTask.new(backend => $b, user-prompt => 'q',
+			max-retries => 0).execute;
+	};
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	like $error.attempts[0]<error>, /'parser:'/, 'classified as a parse failure';
+	is $error.attempts[0]<raw-text>, 'not json at all', 'raw output kept';
+	is $error.attempts[0]<reasoning-text>, THOUGHT, 'trace kept';
+};
+
+subtest 'a model that did not think leaves the key absent' => {
+	for %(responses => ['']),
+		%(responses => ['not json']) -> %shape {
+		my $b = backend(%shape<responses>);
+		my $error = caught {
+			LLM::Data::Inference::JSONTask.new(backend => $b, user-prompt => 'q',
+				max-retries => 0).execute;
+		};
+		isa-ok $error, X::LLM::Data::Inference::Exhausted;
+		nok $error.attempts[0]<reasoning-text>:exists,
+			'no reasoning-text key without a trace';
+	}
+	my $blank = backend([''], fake-reasoning => '');
+	my $error = caught { task($blank).execute };
+	nok $error.attempts[0]<reasoning-text>:exists, 'an empty trace is treated as none';
+};
+
+subtest 'a network failure records thinking only when its Response carried some' => {
+	# The mock mints a Response and applies its fake trace before the
+	# scripted failure quits it, which is the shape of a stream that
+	# dropped mid-thought. A connection that never answered has no
+	# Response text at all, and records nothing.
+	my $dropped = backend(['answer'], fake-reasoning => THOUGHT,
+		error-producer => -> $i { %(class => 'connection', message => 'synthetic drop') });
+	my $error = caught { task($dropped).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	like $error.attempts[0]<error>, /'connection'/, 'network attempt recorded';
+	is $error.attempts[0]<reasoning-text>, THOUGHT, 'a trace that arrived is kept';
+	nok $error.attempts[0]<raw-text>:exists, 'a network failure still has no raw-text';
+
+	my $silent = backend(['answer'],
+		error-producer => -> $i { %(class => 'connection', message => 'synthetic refusal') });
+	my $silent-error = caught { task($silent).execute };
+	nok $silent-error.attempts[0]<reasoning-text>:exists,
+		'nothing is invented for a call that produced no trace';
+};
+
+subtest 'every record of a re-rolled chain carries its own trace' => {
+	my $b = backend(['', ''], fake-reasoning => THOUGHT);
+	my $error = caught { task($b, empty-retries => 1).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $error.attempts.elems, 1, 'the trace blocks the empty re-roll, as documented';
+	is $error.attempts[0]<reasoning-text>, THOUGHT;
+
+	my $parse = backend(['bad one', 'bad two'], fake-reasoning => THOUGHT);
+	my $parse-error = caught {
+		LLM::Data::Inference::JSONTask.new(backend => $parse, user-prompt => 'q',
+			max-retries => 0, parse-retries => 1).execute;
+	};
+	is $parse-error.attempts.elems, 2, 'both parse attempts recorded';
+	is $parse-error.attempts.map(*<reasoning-text>).List, (THOUGHT, THOUGHT),
+		'each record has the trace of its own call';
+};
+
+subtest 'the on-exhausted hook sees the same records' => {
+	my %seen;
+	my $b = backend([''], fake-reasoning => THOUGHT);
+	caught { task($b, on-exhausted => -> %p { %seen = %p }).execute };
+	is %seen<attempts>[0]<reasoning-text>, THOUGHT, 'hook payload carries the trace';
+	nok %seen<summary>.contains(THOUGHT), 'hook summary stays content-free';
+};
+
+subtest 'a cancelled chain keeps the traces already recorded' => {
+	# A parse re-roll re-enters the loop top, which is where the cancel
+	# hook is read; the first attempt's record is already made by then.
+	my Bool $cancel = False;
+	my $b = backend(['bad one', '{"ok":true}'], fake-reasoning => THOUGHT);
+	my $error = caught {
+		LLM::Data::Inference::JSONTask.new(backend => $b, user-prompt => 'q',
+			max-retries => 0, parse-retries => 1,
+			is-cancelled => -> { $cancel },
+			on-call-complete => -> %p { $cancel = True }).execute;
+	};
+	isa-ok $error, X::LLM::Data::Inference::Cancelled;
+	is $b.call-index, 1, 'the re-roll never went out';
+	is $error.attempts.elems, 1, 'the first attempt is on the cancel';
+	is $error.attempts[0]<reasoning-text>, THOUGHT, 'evidence survives the cancel';
+};
+
+done-testing;

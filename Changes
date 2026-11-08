@@ -2,6 +2,42 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.12.0  2026-11-08T11:44:07Z
+
+    - [2026-11-08] **Attempt records keep the model's thinking.** Every
+      attempt whose Response carried C<reasoning-text> now records it
+      verbatim under C<reasoning-text>, on the same presence rule as
+      C<raw-text> (the key is absent when there was none): parser
+      failures, truncations, empty bodies, and network failures that
+      still produced a Response. The empty body is the case that earns
+      it: a thinking model that spends its whole completion inside its
+      reasoning returns a C<200> with nothing in the content, so there
+      is no C<raw-text> to show and the trace is the only evidence of
+      what it was doing. Summaries, telemetry and the C<on-exhausted>
+      summary stay content-free; the trace is on the exception's
+      C<attempts> (and in the hook's C<attempts>), for a failure UI to
+      show. New t/17.
+    - [2026-11-06] **Empty-completion recovery, opt-in.** C<Task> and
+      C<JSONTask> gain C<:empty-retries(N)> (default 0, which preserves
+      every existing behaviour including whitespace-only prose results).
+      With it set, an empty or whitespace-only answer that arrived as an
+      ordinary success (no reasoning, no tool calls, finish reason
+      C<stop> or absent) is re-sent as the identical request at most N
+      extra times across the whole execute, independently of the
+      backend, network and parser budgets and without refilling on a
+      backend advance. Reasoning-only replies, tool-call replies and
+      non-stop finishes never use the allowance. New t/16.
+    - [2026-11-06] **Empty bodies say what arrived.** The "empty
+      response body" summary line names content-free diagnostics —
+      C<answer-chars>, C<reasoning-chars>, C<finish-reason>,
+      C<prompt-tokens>, C<completion-tokens>, C<total-tokens> — each
+      C<unknown> when the provider did not report it, and the attempt
+      record carries the same values under C<response-metadata>. The
+      C<on-call-complete> payload gains C<answer-chars>,
+      C<answer-visible-chars> (after trim) and C<reasoning-chars> on
+      every round-trip whose Response exposes the text. No cause is
+      inferred from any of them.
+
 0.11.0  2026-10-25T13:52:31Z
 
     - Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19 (cpan:TIMOTIMO)

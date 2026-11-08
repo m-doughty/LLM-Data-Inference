@@ -12,8 +12,10 @@ tried without producing a usable result. Its C<message> is the same
 human-readable summary the module has always died with, so string-based
 callers keep working — but the exception additionally carries the
 per-attempt failure records, including the B<raw model output> for
-parser failures, so callers can show the user exactly what the model
-produced instead of only "parser: unexpected ']'".
+parser failures and the B<thinking> of any attempt that produced some,
+so callers can show the user exactly what the model produced instead
+of only "parser: unexpected ']'" — or, for an empty body, what it was
+thinking when it ran out of answer.
 
 C<X::LLM::Data::Inference::Truncated> is a B<subclass> of
 C<Exhausted>, thrown in its place when at least one attempt in the
@@ -186,6 +188,10 @@ unit module LLM::Data::Inference::Exceptions;
       * raw-text      — the full model output, present only for
                         parser failures (network-level failures have
                         no body to keep)
+      * reasoning-text — the model's thinking, present on any attempt
+                        whose Response carried some (an empty body
+                        from a reasoning model usually has nothing
+                        else to show)
     C<message> returns the same aggregate summary string the Task
     used to C<die> with, so existing C<.message>-matching callers are
     unaffected.

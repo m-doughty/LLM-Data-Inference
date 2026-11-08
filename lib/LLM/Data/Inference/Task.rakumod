@@ -77,6 +77,20 @@ Retries use exponential backoff with jitter (C<2^(retry-1) + [0,0.5)>
 seconds, capped at 30 s) to avoid thundering-herd on concurrent
 workers.
 
+=head2 Empty-completion recovery
+
+C<:empty-retries(N)> permits at most N additional calls across one
+C<execute>, independently of backend, network and parser budgets. Default
+0 preserves existing behavior, including whitespace-only prose results.
+Opted-in tasks treat whitespace-only answers as empty. Only successful
+responses with no reasoning or tool calls and a C<stop> or absent finish
+reason qualify. Each retry preserves the previous request unchanged.
+Cancellation is checked before retrying and while the call is in flight.
+
+Empty failures retain content-free response metadata in attempt records
+and summaries. Missing metadata is absent in records and shown as
+C<unknown> in summaries; no cause is inferred from those values.
+
 =head2 Parser failures
 
 When C<:&parser> is set, the parser is invoked on the raw text. A thrown
@@ -94,6 +108,39 @@ the advance rule kicks in. The raw model output of every failed parse
 is preserved on the thrown C<X::LLM::Data::Inference::Exhausted>
 (see L<LLM::Data::Inference::Exceptions>), so callers can surface
 I<what the model actually said> instead of only the parse error.
+
+=head2 Thinking on attempt records
+
+A reasoning model's thinking arrives on the Response's
+C<reasoning-text>, never in its content, and the Task never sends it
+back. It does keep it: every attempt record whose Response carried
+some thinking gets a C<reasoning-text> key holding it verbatim, on
+the same presence rule as C<raw-text> (the key is absent, not
+undefined, when there was none). Parser failures, truncations, empty
+bodies and network failures that still produced a Response all
+qualify.
+
+The empty body is the case that earns this. A thinking model that
+spends its whole completion inside its reasoning returns a C<200>
+with nothing in the content, so there is no C<raw-text> to show, and
+the summary line can only count characters (see
+L</Empty-completion recovery>). The trace itself is the one piece of
+evidence about what the model was doing, and it lives on the record
+for a failure UI to show. Summaries and telemetry stay content-free:
+the trace is on the exception, not in any message.
+
+=begin code :lang<raku>
+
+CATCH {
+    when X::LLM::Data::Inference::Exhausted {
+        for .attempts -> %a {
+            note "model %a<model> thought:\n%a<reasoning-text>"
+                if %a<reasoning-text>:exists;
+        }
+    }
+}
+
+=end code
 
 =head2 Retry feedback
 
@@ -287,7 +334,8 @@ C<X::LLM::Data::Inference::Exhausted> B<or either of its subclasses>
 (see L</Typed exhaustion and levers>) — never on success, and never
 on the C<Cancelled> path. The payload is C<stage =E<gt> 'exhausted'>,
 C<attempts> (the same C<@attempt-records> array the thrown exception
-carries — including C<raw-text> for parse failures), C<summary> (the
+carries — including C<raw-text> for parse failures and
+C<reasoning-text> wherever the model thought out loud), C<summary> (the
 same aggregate string as the exception's C<.message>), and
 C<backends> (the chain length). Like C<&on-call-complete>, a hook
 that throws is shielded — it can never suppress or alter the
@@ -386,6 +434,9 @@ has &.parser;
     malformed output re-rolled is wasted spend; see the module Pod). )
 has UInt:D $.parse-retries = 0;
 
+#| Additional eligible empty-completion calls across the whole execute.
+has UInt:D $.empty-retries = 0;
+
 #|( Tell the model B<why> a parse re-roll is happening. When True, an
     attempt that follows a parser/validator failure on the SAME backend
     carries one extra C<user> turn quoting the rejection reason, which
@@ -444,6 +495,8 @@ has Num:D $.timeout = 120e0;
         model-used / finish-reason — presence-gated, lifted off
         any C<LLM::Chat::Backend::Response> when the provider
         supplies them.
+      * answer-chars / answer-visible-chars / reasoning-chars — content-free counts,
+        present when the Response exposes the corresponding text.
       * cost / generation-id / provider-name / is-byok —
         presence-gated, lifted off Response subclasses that expose
         them (currently C<LLM::Chat::Backend::Response::OpenRouter>).
@@ -540,6 +593,7 @@ method execute(--> Any) {
 	);
 
 	my Int:D $attempt = 0;
+	my UInt $empty-retries-left = $!empty-retries;
 	my @errors;
 	my @attempt-records;
 	my Str:D $truncation-policy = self!effective-truncation-policy;
@@ -554,13 +608,30 @@ method execute(--> Any) {
 	# re-parsing prose to recover it would be a worse contract than
 	# setting a bit while the classification is in hand.
 	my Bool $saw-timeout = False;
-	sub record-failure(Int $backend-index, Str $model, Str $error, Str :$raw-text) {
+	sub record-failure(Int $backend-index, Str $model, Str $error,
+		Str :$raw-text, Str :$reasoning-text, :%diagnostics) {
 		@errors.push: $error;
 		# Shared record shape (raw-text key ABSENT, not undefined, when
 		# there was no body worth keeping) — see LLM::Chat::Retry.
-		@attempt-records.push: attempt-record(
+		my %record = attempt-record(
 			:$backend-index, :model($model), :$error, :$raw-text,
 		);
+		# Same rule for the thinking: the key exists only when the model
+		# produced some. An empty body with a full reasoning trace is the
+		# common shape of a thinking model that never reached its answer,
+		# and the trace is the only evidence of what it was doing.
+		%record<reasoning-text> = $reasoning-text
+			if $reasoning-text.defined && $reasoning-text.chars;
+		%record<response-metadata> = %diagnostics.Hash if %diagnostics.elems;
+		@attempt-records.push: %record;
+	}
+	# The thinking a Response carries, or an undefined Str when it has
+	# none (a non-reasoning model, a call that failed before any arrived,
+	# or no Response at all). Never the content.
+	sub reasoning-of($response --> Str) {
+		return Str without $response;
+		my $text = try { $response.reasoning-text };
+		($text.defined && $text.chars) ?? $text.Str !! Str;
 	}
 	sub cancelled-now(--> Bool) {
 		&!is-cancelled.defined && ?&!is-cancelled();
@@ -628,7 +699,8 @@ method execute(--> Any) {
 					"[backend $i $model-name] "
 					~ "{%call<error-class> // 'unknown'}"
 					~ (%call<error-status>.defined ?? " {%call<error-status>}" !! '')
-					~ ": {%call<error>}");
+					~ ": {%call<error>}",
+					reasoning-text => reasoning-of(%call<response>));
 
 				given $bucket {
 					when 'abort' {
@@ -687,7 +759,8 @@ method execute(--> Any) {
 					"[backend $i $model-name] truncated: output was cut "
 					~ "off by the max_tokens completion budget "
 					~ "(finish_reason 'length')",
-					raw-text => $partial);
+					raw-text => $partial,
+					reasoning-text => reasoning-of(%call<response>));
 				# Advance WITHOUT touching $parse-retries-left: the
 				# same backend re-rolling the same over-budget request
 				# will overrun again at the same max_tokens, while the
@@ -695,9 +768,26 @@ method execute(--> Any) {
 				last;
 			}
 
-			unless $text.defined && $text.chars {
+			unless $text.defined && $text.chars
+				&& (!$!empty-retries || $text.trim.chars) {
+				my %diagnostics = self!response-metadata(%call<response>);
+				my Str $details = <answer-chars reasoning-chars finish-reason
+					prompt-tokens completion-tokens total-tokens>.map({
+					"$_=" ~ (%diagnostics{$_} // 'unknown')
+				}).join(', ');
 				record-failure($i, $model-name,
-					"[backend $i $model-name] empty response body");
+					"[backend $i $model-name] empty response body ($details)",
+					reasoning-text => reasoning-of(%call<response>),
+					:%diagnostics);
+				my $response = %call<response>;
+				if $empty-retries-left > 0 && $response.defined
+					&& ($finish eq '' || $finish eq 'stop')
+					&& !($response.reasoning-text // '').chars
+					&& !$response.has-tool-calls {
+					throw-cancelled if cancelled-now;
+					$empty-retries-left--;
+					next;
+				}
 				last;  # advance
 			}
 
@@ -720,7 +810,8 @@ method execute(--> Any) {
 
 			record-failure($i, $model-name,
 				"[backend $i $model-name] parser: $parse-error",
-				raw-text => $text);
+				raw-text => $text,
+				reasoning-text => reasoning-of(%call<response>));
 			# The ONE place feedback is produced. Overwrites whatever was
 			# pending, so the next re-roll argues about the newest
 			# rejection only. Set unconditionally (not just when a re-roll
@@ -897,6 +988,25 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 	);
 }
 
+# Content-free diagnostics; absent provider values stay absent.
+method !response-metadata($response --> Hash) {
+	return %() unless $response.defined;
+	my %metadata;
+	if $response.msg.defined {
+		%metadata<answer-chars> = $response.msg.chars;
+		%metadata<answer-visible-chars> = $response.msg.trim.chars;
+	}
+	%metadata<reasoning-chars> = $response.reasoning-text.chars
+		if $response.reasoning-text.defined;
+	for <finish-reason prompt-tokens completion-tokens total-tokens> -> $field {
+		my $value = $response."$field"();
+		next unless $value.defined;
+		next if $field eq 'finish-reason' && !$value.chars;
+		%metadata{$field} = $value;
+	}
+	%metadata;
+}
+
 #|( Invoke the on-call-complete hook with a flattened payload.
     Shields the caller from hook exceptions — a broken telemetry
     sink must never interrupt the Task's retry loop. )
@@ -922,6 +1032,11 @@ method !fire-telemetry(
 		error-status => %call<error-status>,
 		response     => %call<response>,
 	);
+	%payload<finish-reason>:delete
+		if %payload<finish-reason>.defined && !%payload<finish-reason>.chars;
+	for self!response-metadata(%call<response>).kv -> $key, $value {
+		%payload{$key} = $value;
+	}
 	try {
 		&!on-call-complete(%payload);
 		CATCH { default { note "telemetry hook: {exception-text($_)}" } }
