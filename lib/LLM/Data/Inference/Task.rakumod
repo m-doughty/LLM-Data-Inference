@@ -91,6 +91,60 @@ Empty failures retain content-free response metadata in attempt records
 and summaries. Missing metadata is absent in records and shown as
 C<unknown> in summaries; no cause is inferred from those values.
 
+An empty body whose Response carries thinking is never retried this
+way; L</Empty responses that carry the answer in the thinking> is the
+rule for that shape.
+
+=head2 Empty responses that carry the answer in the thinking
+
+Some servers file a model's whole output as thinking. llama.cpp's
+chat parser does it when the chat template left the think block open
+and the model never emitted the closing tag: the answer sits in
+C<reasoning_content>, the content is empty, and the finish reason is
+an ordinary C<stop>. DeepSeek's reference parser rejects that
+completion as malformed, so nothing upstream repairs it, and to this
+Task it looks exactly like a model that thought until it ran out of
+things to say — except that the thinking is a complete answer.
+
+C<:empty-response-uses-reasoning> (default False) takes the thinking
+as the response in exactly that case: the call succeeded, the body is
+empty by the same rule L</Empty-completion recovery> uses, the finish
+reason is C<stop> or absent, the Response carries no tool calls, and
+the thinking is non-empty. The thinking then goes through the parser
+as the body would have, or is returned as the text when there is no
+parser. A C<length> finish is never taken: a think block the budget
+cut off is not an answer, and the truncation rule has already dealt
+with it.
+
+A salvaged answer the parser rejects is a parser failure, not an
+empty response: C<:parse-retries> and C<:retry-feedback> apply, the
+attempt record carries C<answer-source =E<gt> 'reasoning'> and the
+thinking under C<reasoning-text>, and C<raw-text> is left out rather
+than repeating the same text. The error line says the parser ran on
+the thinking. C<:empty-retries> never fires once the thinking is
+taken, which is no change: it has always required an empty reasoning
+trace.
+
+A salvage that parses leaves no attempt record, since records are
+failure-only; the C<&on-call-complete> payload says it happened (see
+L</Telemetry>).
+
+=begin code :lang<raku>
+
+my %answer = LLM::Data::Inference::JSONTask.new(
+    backend       => $llama-cpp,
+    system-prompt => 'Reply with a JSON object: {"prompt": ...}',
+    user-prompt   => $scene,
+    required-keys => <prompt>,
+    :empty-response-uses-reasoning,
+    on-call-complete => -> %row {
+        note 'answer taken from the thinking'
+            if %row<used-reasoning-as-response>;
+    },
+).execute;
+
+=end code
+
 =head2 Parser failures
 
 When C<:&parser> is set, the parser is invoked on the raw text. A thrown
@@ -128,6 +182,13 @@ L</Empty-completion recovery>). The trace itself is the one piece of
 evidence about what the model was doing, and it lives on the record
 for a failure UI to show. Summaries and telemetry stay content-free:
 the trace is on the exception, not in any message.
+
+One record shape goes further: a parser failure whose input was the
+thinking rather than the body (see
+L</Empty responses that carry the answer in the thinking>) carries
+C<answer-source =E<gt> 'reasoning'> and no C<raw-text>, so a viewer
+shows the thinking once, under the right heading. Every other record
+has no C<answer-source> key at all.
 
 =begin code :lang<raku>
 
@@ -326,7 +387,11 @@ Every HTTP round-trip fires C<&on-call-complete> (if provided), with
 the attempt number, model name, backend index (position in the chain),
 latency, success flag, usage data, and error details. Parser failures
 do not fire separately — they're classified from the preceding
-telemetry row.
+telemetry row. Every payload also carries
+C<used-reasoning-as-response>, a Bool that is True when the row's
+empty body is being answered from its thinking (see
+L</Empty responses that carry the answer in the thinking>) — the only
+trace a salvage that parses leaves behind.
 
 C<&on-exhausted> (if provided) fires exactly once, on the execute
 thread, immediately before the chain throws
@@ -436,6 +501,17 @@ has UInt:D $.parse-retries = 0;
 
 #| Additional eligible empty-completion calls across the whole execute.
 has UInt:D $.empty-retries = 0;
+
+#|( Take the thinking as the response when the body is empty. Gated on
+    a successful call with a C<stop> or absent finish reason, no tool
+    calls and a non-empty C<reasoning-text>; the thinking then meets
+    the parser exactly as the body would have, and a rejection is a
+    parser failure (re-rolls, feedback) rather than an empty one.
+    Default False: a reasoning model that genuinely thought until it
+    ran out of budget must keep failing as "empty response body". See
+    the "Empty responses that carry the answer in the thinking"
+    section of the module Pod. )
+has Bool:D $.empty-response-uses-reasoning = False;
 
 #|( Tell the model B<why> a parse re-roll is happening. When True, an
     attempt that follows a parser/validator failure on the SAME backend
@@ -609,7 +685,8 @@ method execute(--> Any) {
 	# setting a bit while the classification is in hand.
 	my Bool $saw-timeout = False;
 	sub record-failure(Int $backend-index, Str $model, Str $error,
-		Str :$raw-text, Str :$reasoning-text, :%diagnostics) {
+		Str :$raw-text, Str :$reasoning-text, Str :$answer-source,
+		:%diagnostics) {
 		@errors.push: $error;
 		# Shared record shape (raw-text key ABSENT, not undefined, when
 		# there was no body worth keeping) — see LLM::Chat::Retry.
@@ -622,6 +699,10 @@ method execute(--> Any) {
 		# and the trace is the only evidence of what it was doing.
 		%record<reasoning-text> = $reasoning-text
 			if $reasoning-text.defined && $reasoning-text.chars;
+		# Present only when the parser's input was the thinking rather
+		# than the body, so ordinary records keep their exact shape.
+		%record<answer-source> = $answer-source
+			if $answer-source.defined && $answer-source.chars;
 		%record<response-metadata> = %diagnostics.Hash if %diagnostics.elems;
 		@attempt-records.push: %record;
 	}
@@ -672,11 +753,22 @@ method execute(--> Any) {
 				)
 				!! @messages;
 			my %call = self!call-blocking(@call-messages, $backend);
+			# The finish reason, '' when the provider reported none (or
+			# there is no Response). Read once, here: the truncation rule,
+			# the empty-body rule and the thinking salvage all key on it.
+			my Str $finish = ((%call<response>.defined
+				?? %call<response>.finish-reason
+				!! Str) // '');
+			# Decided before telemetry fires so the row can say so — a
+			# salvage that parses leaves no other trace.
+			my Bool $uses-reasoning =
+				self!takes-reasoning-as-response(%call, $finish);
 			self!fire-telemetry(
 				%call,
 				:$attempt,
 				:backend-index($i),
 				:$model-name,
+				:used-reasoning-as-response($uses-reasoning),
 			);
 			# The in-call poll aborted the response — the round-trip
 			# is on the telemetry record, but its outcome is the
@@ -745,9 +837,6 @@ method execute(--> Any) {
 			# returns an empty body with reason 'length', and calling
 			# that "empty response body" points the reader at the wrong
 			# bug.
-			my Str $finish = ((%call<response>.defined
-				?? %call<response>.finish-reason
-				!! Str) // '');
 			if $finish eq 'length' && $truncation-policy eq 'fail' {
 				$saw-truncation = True;
 				# Keep whatever partial output arrived so the caller
@@ -768,30 +857,41 @@ method execute(--> Any) {
 				last;
 			}
 
-			unless $text.defined && $text.chars
-				&& (!$!empty-retries || $text.trim.chars) {
-				my %diagnostics = self!response-metadata(%call<response>);
-				my Str $details = <answer-chars reasoning-chars finish-reason
-					prompt-tokens completion-tokens total-tokens>.map({
-					"$_=" ~ (%diagnostics{$_} // 'unknown')
-				}).join(', ');
-				record-failure($i, $model-name,
-					"[backend $i $model-name] empty response body ($details)",
-					reasoning-text => reasoning-of(%call<response>),
-					:%diagnostics);
-				my $response = %call<response>;
-				if $empty-retries-left > 0 && $response.defined
-					&& ($finish eq '' || $finish eq 'stop')
-					&& !($response.reasoning-text // '').chars
-					&& !$response.has-tool-calls {
-					throw-cancelled if cancelled-now;
-					$empty-retries-left--;
-					next;
+			# Where the parser's input came from: the body, or the
+			# thinking standing in for an empty body (the attribute's Pod
+			# has the rule). Decided before any failure is recorded, so a
+			# salvage that parses leaves nothing in @errors or the records.
+			my Str $answer-source = 'content';
+			if self!empty-body($text) {
+				if $uses-reasoning {
+					$text = %call<response>.reasoning-text.Str;
+					$answer-source = 'reasoning';
 				}
-				last;  # advance
+				else {
+					my %diagnostics = self!response-metadata(%call<response>);
+					my Str $details = <answer-chars reasoning-chars finish-reason
+						prompt-tokens completion-tokens total-tokens>.map({
+						"$_=" ~ (%diagnostics{$_} // 'unknown')
+					}).join(', ');
+					record-failure($i, $model-name,
+						"[backend $i $model-name] empty response body ($details)",
+						reasoning-text => reasoning-of(%call<response>),
+						:%diagnostics);
+					my $response = %call<response>;
+					if $empty-retries-left > 0 && $response.defined
+						&& ($finish eq '' || $finish eq 'stop')
+						&& !($response.reasoning-text // '').chars
+						&& !$response.has-tool-calls {
+						throw-cancelled if cancelled-now;
+						$empty-retries-left--;
+						next;
+					}
+					last;  # advance
+				}
 			}
 
-			# No parser — raw text is the result.
+			# No parser — the text (body, or the thinking standing in for
+			# an empty body) is the result.
 			return $text unless &!parser.defined;
 
 			my $parsed;
@@ -808,9 +908,19 @@ method execute(--> Any) {
 			}
 			return $parsed unless $parse-failed;
 
+			# A rejected salvage names its input and leaves raw-text out:
+			# the thinking is already on the record as reasoning-text, and
+			# repeating it under a second key would show it twice.
+			my %source-args = $answer-source eq 'reasoning'
+				?? %( :$answer-source )
+				!! %( raw-text => $text );
 			record-failure($i, $model-name,
-				"[backend $i $model-name] parser: $parse-error",
-				raw-text => $text,
+				"[backend $i $model-name] parser"
+				~ ($answer-source eq 'reasoning'
+					?? ' (on the thinking, the response body being empty)'
+					!! '')
+				~ ": $parse-error",
+				|%source-args,
 				reasoning-text => reasoning-of(%call<response>));
 			# The ONE place feedback is produced. Overwrites whatever was
 			# pending, so the next re-roll argues about the newest
@@ -988,6 +1098,30 @@ method !call-blocking(@messages, LLM::Chat::Backend $backend --> Hash) {
 	);
 }
 
+#|( The empty-body rule, shared by the empty-completion branch and the
+    thinking salvage so the two can never disagree: no text, or no
+    characters, or — only once C<:empty-retries> has opted the Task
+    into it — nothing but whitespace. )
+method !empty-body(Str $text --> Bool:D) {
+	!($text.defined && $text.chars && (!$!empty-retries || $text.trim.chars));
+}
+
+#|( Whether this round-trip's empty body is answered from its thinking:
+    the option is on, the call succeeded, the body is empty by
+    C<!empty-body>, the finish reason is 'stop' or absent, the Response
+    carries no tool calls, and its C<reasoning-text> has characters. A
+    'length' finish is excluded on purpose — the truncation rule owns
+    it, and a think block the budget cut off is not an answer. )
+method !takes-reasoning-as-response(%call, Str:D $finish --> Bool:D) {
+	return False unless $!empty-response-uses-reasoning && %call<success>;
+	my $response = %call<response>;
+	return False without $response;
+	return False unless self!empty-body(%call<text>);
+	return False unless $finish eq '' || $finish eq 'stop';
+	return False if $response.has-tool-calls;
+	so ($response.reasoning-text // '').chars;
+}
+
 # Content-free diagnostics; absent provider values stay absent.
 method !response-metadata($response --> Hash) {
 	return %() unless $response.defined;
@@ -1015,6 +1149,7 @@ method !fire-telemetry(
 	:$attempt,
 	:$backend-index,
 	:$model-name,
+	Bool:D :$used-reasoning-as-response = False,
 ) {
 	return unless &!on-call-complete.defined;
 	# Payload shape (which keys are always present, which are gated on
@@ -1037,6 +1172,10 @@ method !fire-telemetry(
 	for self!response-metadata(%call<response>).kv -> $key, $value {
 		%payload{$key} = $value;
 	}
+	# Always present, so a consumer reads it as a plain Bool: True only
+	# when this row's empty body is being answered from its thinking
+	# (see $.empty-response-uses-reasoning).
+	%payload<used-reasoning-as-response> = $used-reasoning-as-response;
 	try {
 		&!on-call-complete(%payload);
 		CATCH { default { note "telemetry hook: {exception-text($_)}" } }

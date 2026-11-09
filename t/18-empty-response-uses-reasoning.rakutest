@@ -1,0 +1,172 @@
+use Test;
+use lib 'lib';
+use LLM::Data::Inference::Task;
+use LLM::Data::Inference::JSONTask;
+use LLM::Data::Inference::Exceptions;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Settings;
+
+# A server that files the model's whole output as thinking hands the
+# Task an empty body beside a complete answer. `:empty-response-uses-
+# reasoning` takes the thinking as the response in exactly that shape:
+# a successful call, an empty body, a `stop` (or absent) finish, no
+# tool calls, a non-empty trace. Everything else about the empty-body
+# rule, and every other finish, is unchanged.
+
+constant ANSWER  = '{"prompt":"a lamp on a desk","negative_prompt":""}';
+constant THOUGHT = 'Synthetic private deliberation about the answer';
+
+sub backend(@responses, *%options) {
+	LLM::Chat::Backend::Mock.new(settings => LLM::Chat::Backend::Settings.new,
+		:@responses, |%options);
+}
+sub stop() { -> $i { 'stop' } }
+sub caught(&work) {
+	my $error;
+	try { work(); CATCH { default { $error = $_ } } }
+	$error;
+}
+sub json-task($backend, *%options) {
+	LLM::Data::Inference::JSONTask.new(:$backend, user-prompt => 'q',
+		required-keys => <prompt>, max-retries => 0, |%options);
+}
+sub plain-task($backend, *%options) {
+	LLM::Data::Inference::Task.new(:$backend, user-prompt => 'q',
+		max-retries => 0, |%options);
+}
+
+plan 9;
+
+subtest 'off by default: an answer inside the thinking is still an empty response' => {
+	plan 5;
+	my @rows;
+	my $b = backend([''], fake-reasoning => ANSWER, finish-reason-producer => stop);
+	my $error = caught {
+		json-task($b, on-call-complete => -> %row { @rows.push: %row }).execute;
+	};
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	like $error.attempts[0]<error>, /'empty response body'/, 'classified as empty';
+	is $error.attempts[0]<reasoning-text>, ANSWER, 'the thinking stays on the record';
+	nok $error.attempts[0]<answer-source>:exists,
+		'an ordinary record has no answer-source key';
+	is-deeply @rows.map(*<used-reasoning-as-response>).List, (False,),
+		'telemetry says the thinking was not used';
+};
+
+subtest 'on: the thinking is parsed as the answer' => {
+	plan 5;
+	my @rows;
+	my Int $exhausted = 0;
+	my $b = backend([''], fake-reasoning => ANSWER, finish-reason-producer => stop);
+	my %answer = json-task($b, :empty-response-uses-reasoning,
+		on-call-complete => -> %row { @rows.push: %row },
+		on-exhausted     => -> %info { $exhausted++ },
+	).execute;
+	is %answer<prompt>, 'a lamp on a desk', 'the JSON inside the thinking is the result';
+	is $b.call-index, 1, 'one call did it';
+	is @rows.elems, 1, 'one telemetry row';
+	ok @rows[0]<used-reasoning-as-response>, 'and it says the thinking was used';
+	is $exhausted, 0, 'nothing was exhausted';
+};
+
+subtest 'an absent finish reason qualifies like stop' => {
+	plan 1;
+	my $b = backend([''], fake-reasoning => ANSWER, finish-reason-producer => -> $i { '' });
+	is json-task($b, :empty-response-uses-reasoning).execute<prompt>, 'a lamp on a desk',
+		'a provider that reports no finish reason is taken at its word';
+};
+
+subtest 'on, without a parser: the thinking is returned as the text' => {
+	plan 2;
+	my $b = backend([''], fake-reasoning => THOUGHT, finish-reason-producer => stop);
+	is plain-task($b, :empty-response-uses-reasoning).execute, THOUGHT,
+		'the thinking stands in for the body';
+	is $b.call-index, 1, 'in one call';
+};
+
+subtest 'a length finish is never taken' => {
+	plan 4;
+	# The JSONTask default policy ('fail' with a parser): the truncation
+	# rule records it before the empty-body rule is ever consulted.
+	my $b = backend([''], fake-reasoning => ANSWER, finish-reason-producer => -> $i { 'length' });
+	my $error = caught { json-task($b, :empty-response-uses-reasoning).execute };
+	isa-ok $error, X::LLM::Data::Inference::Truncated, 'the truncation rule owns a length finish';
+	is $error.attempts[0]<reasoning-text>, ANSWER, 'the thinking stays on the record';
+	# Policy 'accept' lets a length finish reach the empty-body rule,
+	# where the finish gate still refuses to salvage it.
+	my $b2 = backend([''], fake-reasoning => ANSWER, finish-reason-producer => -> $i { 'length' });
+	my $error2 = caught {
+		plain-task($b2, :empty-response-uses-reasoning, truncation-policy => 'accept').execute;
+	};
+	isa-ok $error2, X::LLM::Data::Inference::Exhausted;
+	like $error2.attempts[0]<error>, /'empty response body'/,
+		'an accepted truncation with an empty body is still an empty body';
+};
+
+subtest 'a response carrying tool calls is never taken' => {
+	plan 2;
+	my class ToolCallResponse is LLM::Chat::Backend::Response {
+		method has-tool-calls(--> Bool:D) { True }
+	}
+	my $b = backend([''], fake-reasoning => ANSWER, finish-reason-producer => stop,
+		response-class => ToolCallResponse);
+	my $error = caught { json-task($b, :empty-response-uses-reasoning).execute };
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	like $error.attempts[0]<error>, /'empty response body'/,
+		'a tool-calling turn with an empty body is not an answer in disguise';
+};
+
+subtest 'bad JSON in the thinking is a parser failure that re-rolls under parse-retries' => {
+	plan 15;
+	my @rows;
+	my $b = backend(['', ''], fake-reasoning => 'not json at all',
+		finish-reason-producer => stop);
+	my $error = caught {
+		json-task($b, :empty-response-uses-reasoning, parse-retries => 1,
+			:retry-feedback, on-call-complete => -> %row { @rows.push: %row }).execute;
+	};
+	isa-ok $error, X::LLM::Data::Inference::Exhausted;
+	is $b.call-index, 2, 'the re-roll budget was spent on the rejected salvage';
+	is $error.attempts.elems, 2, 'both rejections are recorded';
+	for $error.attempts -> %a {
+		like %a<error>, /'parser (on the thinking, the response body being empty):'/,
+			'the error names its input';
+		is %a<answer-source>, 'reasoning', 'the record marks its source';
+		nok %a<raw-text>:exists, 'the thinking is not repeated as raw-text';
+		is %a<reasoning-text>, 'not json at all', 'it is on the record once, as thinking';
+	}
+	like $error.message, /'on the thinking'/, 'the summary says where the parser looked';
+	nok $error.message.contains('not json at all'), 'and never quotes the thinking';
+	is $b.recorded-calls[1]<messages>.elems, $b.recorded-calls[0]<messages>.elems + 1,
+		'the re-roll carried the retry feedback, as any parser failure would';
+	ok @rows.all<used-reasoning-as-response>, 'every telemetry row says the thinking was used';
+};
+
+subtest 'whitespace-only bodies follow the empty-retries rule' => {
+	plan 4;
+	# Once :empty-retries has opted the task into "whitespace is empty",
+	# the salvage sees an empty body and no empty retry is spent.
+	my $b = backend(['   '], fake-reasoning => ANSWER, finish-reason-producer => stop);
+	is json-task($b, :empty-response-uses-reasoning, empty-retries => 1).execute<prompt>,
+		'a lamp on a desk', 'whitespace counts as empty once empty-retries opted in';
+	is $b.call-index, 1, 'and no empty retry is spent';
+	# Without it a whitespace body is a body: the parser sees it, not
+	# the thinking, exactly as before.
+	my $b2 = backend(['   '], fake-reasoning => ANSWER, finish-reason-producer => stop);
+	my $error = caught { json-task($b2, :empty-response-uses-reasoning).execute };
+	like $error.attempts[0]<error>, /'parser:'/,
+		'without empty-retries a whitespace body is still a body';
+	is $error.attempts[0]<raw-text>, '   ', 'and is kept as raw-text';
+};
+
+subtest 'a body with content is never second-guessed' => {
+	plan 2;
+	my @rows;
+	my $b = backend(['{"prompt":"from the body","negative_prompt":""}'],
+		fake-reasoning => ANSWER, finish-reason-producer => stop);
+	is json-task($b, :empty-response-uses-reasoning,
+		on-call-complete => -> %row { @rows.push: %row }).execute<prompt>,
+		'from the body', 'the body wins whenever it has content';
+	nok @rows[0]<used-reasoning-as-response>, 'telemetry says the body was used';
+};

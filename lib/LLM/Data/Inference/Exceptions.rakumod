@@ -192,6 +192,12 @@ unit module LLM::Data::Inference::Exceptions;
                         whose Response carried some (an empty body
                         from a reasoning model usually has nothing
                         else to show)
+      * answer-source — 'reasoning', present only on a parser failure
+                        whose input was the thinking standing in for
+                        an empty body (Task's
+                        C<:empty-response-uses-reasoning>); such a
+                        record has no raw-text, the thinking being
+                        on it already
     C<message> returns the same aggregate summary string the Task
     used to C<die> with, so existing C<.message>-matching callers are
     unaffected.

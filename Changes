@@ -2,6 +2,29 @@ Revision history for LLM::Data::Inference
 
 {{$NEXT}}
 
+0.13.0  2026-11-08T15:43:07Z
+
+    - [2026-11-08] **An empty body can take its answer from the thinking,
+      opt-in.** llama.cpp's chat parser files a model's whole output as
+      C<reasoning_content> when the chat template left the think block
+      open and the model never closed it — the answer arrives as
+      thinking beside an empty body and a C<stop> finish, which the
+      Task could only report as "empty response body" (a shape
+      DeepSeek's own parser rejects as malformed, so nothing upstream
+      repairs it). C<Task> and C<JSONTask> gain
+      C<:empty-response-uses-reasoning> (default False): when the call
+      succeeded, the body is empty by the existing rule, the finish is
+      C<stop> or absent, there are no tool calls and the thinking is
+      non-empty, the thinking goes through the parser as the body would
+      have (or is returned as the text without one). A C<length> finish
+      is never taken. A rejected salvage is a parser failure —
+      C<:parse-retries> and C<:retry-feedback> apply — whose record
+      carries C<answer-source =E<gt> 'reasoning'> and no C<raw-text>,
+      and whose error line says the parser ran on the thinking. Every
+      C<on-call-complete> payload now carries
+      C<used-reasoning-as-response> (Bool), the only trace a salvage
+      that parses leaves. New t/18.
+
 0.12.0  2026-11-08T11:44:07Z
 
     - [2026-11-08] **Attempt records keep the model's thinking.** Every

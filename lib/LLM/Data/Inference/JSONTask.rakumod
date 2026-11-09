@@ -65,6 +65,15 @@ section for the full rules.
 C<:empty-retries> threads through unchanged. It defaults to zero and
 permits only the narrow empty-completion recovery described in Task.
 
+C<:empty-response-uses-reasoning> threads through unchanged too. Off
+by default; on, an empty body beside a non-empty thinking trace (a
+C<stop> finish, no tool calls) puts the thinking through the JSON
+extractor as the body would have been — the shape a server produces
+when it files the model's whole output as thinking. A rejection is an
+ordinary parser failure, so C<:parse-retries> and C<:retry-feedback>
+apply to it. See Task's "Empty responses that carry the answer in the
+thinking" section.
+
 Accepts either C<:$backend> (single) or C<:@backends> (chain); both
 forms thread through to the inner Task unchanged.
 
@@ -100,6 +109,10 @@ has UInt:D $.parse-retries = 0;
 
 #| Whole-execute empty-completion allowance, threaded through to Task.
 has UInt:D $.empty-retries = 0;
+
+#| Take a non-empty thinking trace as the answer when the body is
+#| empty, threaded through to Task (see its Pod for the exact gate).
+has Bool:D $.empty-response-uses-reasoning = False;
 
 #|( Give parse re-rolls the rejection reason, threaded through to the
     inner Task — see its "Retry feedback" Pod section. A JSON task is
@@ -182,6 +195,7 @@ method execute(--> Any) {
 		:$!max-retries,
 		:$!parse-retries,
 		:$!empty-retries,
+		:$!empty-response-uses-reasoning,
 		:$!retry-feedback,
 		:$!truncation-policy,
 		:$!timeout,
